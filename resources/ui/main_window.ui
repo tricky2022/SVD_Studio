@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect><x>0</x><y>0</y><width>1440</width><height>900</height></rect>
+  </property>
+  <property name="windowTitle"><string>SVD Studio</string></property>
+  <widget class="QWidget" name="centralWidget">
+   <layout class="QVBoxLayout" name="rootLayout">
+    <property name="spacing"><number>4</number></property>
+    <property name="leftMargin"><number>6</number></property>
+    <property name="topMargin"><number>6</number></property>
+    <property name="rightMargin"><number>6</number></property>
+    <property name="bottomMargin"><number>6</number></property>
+    <item>
+     <widget class="QFrame" name="workspaceHeader">
+      <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+      <layout class="QHBoxLayout" name="headerLayout">
+       <property name="leftMargin"><number>8</number></property>
+       <property name="topMargin"><number>5</number></property>
+       <property name="rightMargin"><number>8</number></property>
+       <property name="bottomMargin"><number>5</number></property>
+       <item><widget class="QLabel" name="brandMark"><property name="text"><string>SVD</string></property></widget></item>
+       <item><widget class="QLabel" name="workspaceTitle"><property name="text"><string>STUDIO</string></property></widget></item>
+       <item><widget class="QLabel" name="workspaceSubtitle"><property name="text"><string>DEVICE DESCRIPTION WORKBENCH</string></property></widget></item>
+       <item><spacer name="headerSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint"><size><width>40</width><height>20</height></size></property></spacer></item>
+       <item><widget class="QLabel" name="workspaceState"><property name="text"><string>NO PROJECT</string></property></widget></item>
+       <item><widget class="QLineEdit" name="searchLine"><property name="placeholderText"><string>Search  /  Ctrl+F</string></property><property name="clearButtonEnabled"><bool>true</bool></property></widget></item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QSplitter" name="mainSplitter">
+      <property name="orientation"><enum>Qt::Horizontal</enum></property>
+      <property name="childrenCollapsible"><bool>false</bool></property>
+      <widget class="QFrame" name="navigationPanel">
+       <property name="minimumSize"><size><width>220</width><height>0</height></size></property>
+       <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+       <layout class="QVBoxLayout" name="navigationLayout">
+        <item><widget class="QLabel" name="navigationTitle"><property name="text"><string>DEVICE EXPLORER</string></property></widget></item>
+        <item><widget class="QTreeView" name="deviceTree"><property name="headerHidden"><bool>true</bool></property><property name="uniformRowHeights"><bool>true</bool></property><property name="rootIsDecorated"><bool>true</bool></property></widget></item>
+       </layout>
+      </widget>
+      <widget class="QFrame" name="editorPanel">
+       <property name="minimumSize"><size><width>460</width><height>0</height></size></property>
+       <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+       <layout class="QVBoxLayout" name="editorLayout">
+        <item><widget class="QLabel" name="editorTitle"><property name="text"><string>REGISTER EDITOR</string></property></widget></item>
+        <item><widget class="QFrame" name="registerMapPlaceholder"><property name="minimumSize"><size><width>0</width><height>120</height></size></property><property name="frameShape"><enum>QFrame::StyledPanel</enum></property><layout class="QVBoxLayout" name="registerMapLayout"><item><widget class="QLabel" name="registerMapTitle"><property name="text"><string>Register Map</string></property></widget></item><item><widget class="QTableView" name="registerMapView"/></item></layout></widget></item>
+        <item><widget class="QFrame" name="bitViewPlaceholder"><property name="minimumSize"><size><width>0</width><height>180</height></size></property><property name="frameShape"><enum>QFrame::StyledPanel</enum></property><layout class="QVBoxLayout" name="bitViewLayout"><item><widget class="QLabel" name="bitViewTitle"><property name="text"><string>Bit Layout</string></property></widget></item></layout></widget></item>
+        <item><widget class="QTabWidget" name="lowerTabs"><property name="currentIndex"><number>0</number></property><widget class="QWidget" name="problemsTab"><attribute name="title"><string>Problems</string></attribute><layout class="QVBoxLayout" name="problemsLayout"><item><widget class="QListWidget" name="problemsList"/></item></layout></widget><widget class="QWidget" name="outputTab"><attribute name="title"><string>Output</string></attribute><layout class="QVBoxLayout" name="outputLayout"><item><widget class="QPlainTextEdit" name="outputText"><property name="readOnly"><bool>true</bool></property></widget></item></layout></widget></widget></item>
+       </layout>
+      </widget>
+      <widget class="QFrame" name="propertiesPanel">
+       <property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+       <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+       <layout class="QVBoxLayout" name="propertiesLayout">
+        <item><widget class="QLabel" name="propertiesTitle"><property name="text"><string>PROPERTIES</string></property></widget></item>
+        <item><widget class="QTableWidget" name="propertyEditor"/></item>
+       </layout>
+      </widget>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

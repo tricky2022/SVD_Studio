@@ -1,0 +1,55 @@
+[project]
+name = "svd-studio"
+version = "0.2.0"
+description = "A professional CMSIS-SVD workbench for inspect, edit, validate and export"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "SVD Studio Contributors" }]
+requires-python = ">=3.10"
+keywords = ["cmsis-svd", "embedded", "microcontroller", "register-map", "eda"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Embedded Systems",
+]
+dependencies = [
+  "PySide6>=6.6",
+  "cmsis-svd>=0.4",
+  "lxml>=5.0",
+  "pyyaml>=6.0",
+  "xmlschema>=2.5",
+  "qdarkstyle>=3.2",
+  "qtawesome>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+excel = ["openpyxl>=3.1"]
+release = ["pyinstaller>=6.0", "pillow>=10.0"]
+
+[project.urls]
+Homepage = "https://github.com/your-org/svd-studio"
+Repository = "https://github.com/your-org/svd-studio"
+Issues = "https://github.com/your-org/svd-studio/issues"
+
+[project.scripts]
+svdstudio = "svdstudio.cli:main"
+svdstudio-gui = "svdstudio.app:main"
+
+[tool.setuptools.packages.find]
+include = ["svdstudio*"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
