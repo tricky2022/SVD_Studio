@@ -4,6 +4,14 @@ SVD Studio is a desktop CMSIS-SVD workbench for embedded engineers. It combines 
 
 > Status: Beta / active development. The project is usable for real SVD exploration and authoring, but vendor-specific SVD extensions should be validated before production release.
 
+<p align="center">
+  <img src="docs/images/2.png" width="90%">
+</p>
+
+<p align="center">
+  <img src="docs/images/1.png" width="90%">
+</p>
+
 ## What it does
 
 - Open, inspect and round-trip CMSIS-SVD files.
