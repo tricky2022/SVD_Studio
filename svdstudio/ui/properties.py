@@ -99,6 +99,10 @@ class PropertyEditor(QTableWidget):
         self._row_attr: list[str | None] = []
         self.cellChanged.connect(self._on_cell)
 
+    def current_object(self):
+        """The domain object currently shown (None when the panel is empty)."""
+        return self._obj
+
     def refresh(self):
         """Re-render with current palette and language."""
         self.setHorizontalHeaderLabels([t("property"), t("value")])

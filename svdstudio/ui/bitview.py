@@ -38,15 +38,24 @@ class _BitCanvas(QWidget):
     fieldClicked = Signal(object)
     createRequested = Signal(int)
 
-    def __init__(self):
+    def __init__(self, menu_signal=None):
         super().__init__()
         self.reg: SvdRegister | None = None
+        self._menu_signal = menu_signal
         self._rects: list[tuple[QRect, SvdField]] = []
         self._hover: SvdField | None = None
         self.setMinimumWidth(420)
         self.setFixedHeight(CANVAS_HEIGHT)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+
+    def _on_context_menu(self, pos):
+        if self._menu_signal is None:
+            return
+        bit = self._bit_at(pos.x())
+        self._menu_signal.emit(bit if bit is not None else -1, self.mapToGlobal(pos))
 
     def set_register(self, register: SvdRegister | None):
         self.reg = register
@@ -197,16 +206,21 @@ class _BitCanvas(QWidget):
 class BitView(QWidget):
     fieldClicked = Signal(object)
     fieldEdited = Signal(object, str, object)
+    fieldMoved = Signal(object, int, int)  # field, new lsb, new width
     createRequested = Signal(int)
+    canvasMenuRequested = Signal(int, object)  # bit (-1 when none), global pos
+    legendMenuRequested = Signal(object)  # global pos; rows resolved by the window
 
-    # legend columns the user may edit in place: name / access / description
-    EDITABLE_COLUMNS: typing.ClassVar[dict] = {0: "name", 3: "access", 5: "description"}
+    # legend columns the user may edit in place
+    EDITABLE_COLUMNS: typing.ClassVar[dict] = {
+        0: "name", 1: "bits", 2: "width", 3: "access", 5: "description",
+    }
 
     def __init__(self):
         super().__init__()
         self.reg: SvdRegister | None = None
         self._legend_loading = False
-        self.canvas = _BitCanvas()
+        self.canvas = _BitCanvas(menu_signal=self.canvasMenuRequested)
         self.canvas.createRequested.connect(self.createRequested.emit)
         self.title = QLabel(t("bit_layout_title"))
         self.legend = QTableWidget(0, 6)
@@ -215,6 +229,8 @@ class BitView(QWidget):
         self.legend.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.legend.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
                                     | QAbstractItemView.EditTrigger.EditKeyPressed)
+        from svdstudio.ui.delegates import AccessDelegate
+        self.legend.setItemDelegateForColumn(3, AccessDelegate(self.legend))
         self.legend.itemChanged.connect(self._on_legend_changed)
         self.legend.setAlternatingRowColors(True)
         self.legend.verticalHeader().setVisible(False)
@@ -229,6 +245,8 @@ class BitView(QWidget):
         header.setMinimumSectionSize(56)
         self.legend.setColumnWidth(0, 170)
         self.legend.cellClicked.connect(self._legend_clicked)
+        self.legend.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.legend.customContextMenuRequested.connect(self._on_legend_menu)
         self.canvas.fieldClicked.connect(self._canvas_clicked)
 
         layout = QVBoxLayout(self)
@@ -290,6 +308,22 @@ class BitView(QWidget):
                 cell.setData(Qt.ItemDataRole.UserRole, field)
                 self.legend.setItem(row, column, cell)
 
+    @staticmethod
+    def parse_bits(text: str) -> tuple[int, int] | None:
+        """Parse 'msb:lsb' or a single bit into (lsb, width); None when invalid."""
+        text = text.strip().replace(" ", "")
+        try:
+            if ":" in text:
+                msb_s, lsb_s = text.split(":", 1)
+                msb, lsb = int(msb_s, 0), int(lsb_s, 0)
+                if msb < lsb or lsb < 0:
+                    return None
+                return lsb, msb - lsb + 1
+            bit = int(text, 0)
+            return (bit, 1) if bit >= 0 else None
+        except ValueError:
+            return None
+
     def _on_legend_changed(self, item: QTableWidgetItem):
         if self._legend_loading:
             return
@@ -304,7 +338,25 @@ class BitView(QWidget):
                 return
             if text == field.name:
                 return
-        elif text == (getattr(field, attr) or ""):
+            self.fieldEdited.emit(field, attr, text)
+            return
+        if attr in ("bits", "width"):
+            parsed = self.parse_bits(text) if attr == "bits" else None
+            if attr == "width":
+                try:
+                    width = int(text, 0)
+                    parsed = (field.lsb, width) if width >= 1 else None
+                except ValueError:
+                    parsed = None
+            if parsed is None or parsed == (field.lsb, field.bit_width):
+                if parsed is None:
+                    self.set_register(self.reg)  # revert invalid geometry text
+                return
+            self.fieldMoved.emit(field, parsed[0], parsed[1])
+            return
+        if text == (getattr(field, attr) or ""):
+            if attr == "access" and item.text() != (field.access or "—"):
+                self.set_register(self.reg)  # normalize the "—" display
             return
         self.fieldEdited.emit(field, attr, text)
 
@@ -322,6 +374,9 @@ class BitView(QWidget):
         self._fade_anim.setEndValue(1.0)
         self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._fade_anim.start()
+
+    def _on_legend_menu(self, pos):
+        self.legendMenuRequested.emit(self.legend.mapToGlobal(pos))
 
     def _canvas_clicked(self, field: SvdField):
         self._select_field(field)

@@ -21,9 +21,18 @@ QLineEdit:focus { background: #1d2633; border: 1px solid #8295e7; }
 QComboBox { min-height: 23px; padding: 1px 6px; background: #242d3a; color: #dbe4f0; border: 1px solid #435168; border-radius: 4px; }
 QComboBox:hover, QComboBox:focus { border-color: #8295e7; }
 QComboBox QAbstractItemView { background: #293342; border: 1px solid #435168; selection-background-color: #3a4d7e; selection-color: #ffffff; }
-QFrame#navigationPanel, QFrame#editorPanel, QFrame#propertiesPanel { background: #242d3a; border: 1px solid #354255; border-radius: 8px; }
-QFrame#registerMapPlaceholder, QFrame#bitViewPlaceholder { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #293342, stop:1 #242d3a); border: 1px solid #3a4658; border-radius: 6px; }
-QLabel#navigationTitle, QLabel#editorTitle, QLabel#propertiesTitle { color: #91a1b6; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+QFrame#navigationPanel, QFrame#editorPanel, QFrame#propertiesPanel {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #27303e, stop:1 #232b38);
+    border: 1px solid #3a4658; border-radius: 10px; }
+QFrame#registerMapPlaceholder, QFrame#bitViewPlaceholder {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2a3444, stop:1 #242d3a);
+    border: 1px solid #39465a; border-radius: 8px; }
+QLabel#navigationTitle { color: #aab9f0; background: rgba(130,149,231,0.14); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
+QLabel#editorTitle { color: #8fd0a8; background: rgba(111,184,148,0.14); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
+QLabel#propertiesTitle { color: #d9bd7a; background: rgba(201,164,92,0.16); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
 QLabel#registerMapTitle, QLabel#bitViewTitle { color: #d5dfeb; font-size: 10px; font-weight: 700; }
 QLabel#workspaceTitle { color: #eef4ff; font-size: 16px; font-weight: 700; letter-spacing: 1px; }
 QLabel#workspaceSubtitle { color: #8e9caf; font-size: 9px; }

@@ -154,6 +154,9 @@ class MainWindow(QMainWindow):
         self.props.valueEdited.connect(self._edit)
         self.bitview.fieldClicked.connect(self._show_object)
         self.bitview.fieldEdited.connect(self._edit_field_from_legend)
+        self.bitview.fieldMoved.connect(self._move_field_geometry)
+        self.bitview.canvasMenuRequested.connect(self._bit_canvas_menu)
+        self.bitview.legendMenuRequested.connect(self._legend_menu)
         self.bitview.createRequested.connect(self._create_field_at_bit)
         # Eclipse-style problems: double-click jumps, jump icon per row
         self.problems.itemDoubleClicked.connect(lambda _: self._jump_to_problem())
@@ -193,6 +196,7 @@ class MainWindow(QMainWindow):
         # VS-style tree: context menu + keyboard instead of button bar
         self.device_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.device_tree.customContextMenuRequested.connect(self._tree_menu)
+        self.device_tree.doubleClicked.connect(self._rename_at)
         self.device_tree.expanded.connect(lambda _: self._sync_breadcrumb())
         self._apply_texts()
         self._retranslate_panels()
@@ -270,7 +274,13 @@ class MainWindow(QMainWindow):
         self.state.dirty = True
 
     def _rename_at(self, proxy_index=None):
-        """Open the in-place rename editor for a tree node (double-click / F2)."""
+        """Open the in-place rename editor for a tree node (double-click / F2).
+
+        The current name is pre-selected so the user can retype it outright
+        or click again to place the cursor for a partial edit.
+        """
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QLineEdit
         index = proxy_index if proxy_index is not None else self.device_tree.currentIndex()
         if not index.isValid():
             return
@@ -279,6 +289,12 @@ class MainWindow(QMainWindow):
         if node is None or node.obj is None or not hasattr(node.obj, "name"):
             return
         self.device_tree.edit(index)
+
+        def select_editor_text():
+            editor = self.device_tree.viewport().findChild(QLineEdit)
+            if editor is not None:
+                editor.selectAll()
+        QTimer.singleShot(0, select_editor_text)
 
     def _rename_from_tree(self, obj, new: str):
         """Validate a tree rename and route it through the undo stack."""
@@ -317,6 +333,9 @@ class MainWindow(QMainWindow):
             self._select(index)
         menu = QMenu(self)
         menu.addAction(t("rename"), self._rename_at)
+        if self._selected_node is not None and isinstance(self._selected_node.obj, SvdRegister):
+            self.bitview.set_register(self._selected_node.obj)
+            menu.addAction(t("field_batch"), self._batch_add_fields)
         menu.addSeparator()
         menu.addAction(t("add"), self.add_selected_child)
         menu.addAction(t("duplicate"), self.duplicate_selected)
@@ -823,6 +842,10 @@ class MainWindow(QMainWindow):
         view.setSelectionMode(view.SelectionMode.ExtendedSelection)
         view.setEditTriggers(view.EditTrigger.DoubleClicked | view.EditTrigger.EditKeyPressed
                              | view.EditTrigger.AnyKeyPressed)
+        from svdstudio.ui.delegates import AccessDelegate
+        if not getattr(view, "_svd_access_delegate", False):
+            view.setItemDelegateForColumn(2, AccessDelegate(view))
+            view._svd_access_delegate = True
         header = view.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
@@ -895,6 +918,8 @@ class MainWindow(QMainWindow):
                 if value != (reg.access or ""):
                     self.undo.push(C.SetAttrCommand(reg, "access", value, self._refresh))
                     self.state.dirty = True
+                elif item.text() != (reg.access or "—"):
+                    self._refresh()  # normalize the "—" display, no undo step
             elif col == 3:
                 new = int(text, 0)
                 if new != reg.reset_value:
@@ -1006,9 +1031,18 @@ class MainWindow(QMainWindow):
     def _map_edit_selected(self, peripheral, rows):
         regs = sorted(peripheral.registers, key=lambda r: r.address_offset)
         targets = [regs[r] for r in rows if 0 <= r < len(regs)]
-        if targets:
-            self._select_object(targets[0])
-            self.props.setFocus()
+        if not targets:
+            return
+        self._select_object(targets[0])
+        view = self.findChild(QWidget, "registerMapView")
+        if view is not None and hasattr(view, "model"):
+            model = view.model()
+            for row in range(model.rowCount()):
+                item = model.item(row, 1)
+                if item is not None and item.data(Qt.ItemDataRole.UserRole) is targets[0]:
+                    view.setCurrentIndex(model.index(row, 1))
+                    view.edit(model.index(row, 1))
+                    break
 
     def _map_delete_selected(self, peripheral, rows):
         regs = sorted(peripheral.registers, key=lambda r: r.address_offset)
@@ -1243,6 +1277,145 @@ class MainWindow(QMainWindow):
     def _edit_field_from_legend(self, field, attr, new):
         self.undo.push(C.SetAttrCommand(field, attr, new, self._refresh))
         self.state.dirty = True
+
+    def _move_field_geometry(self, field, lsb: int, width: int):
+        reg = self.bitview.reg
+        if reg is None or field not in reg.fields:
+            return
+        size = reg.size or 32
+        if lsb < 0 or width < 1 or lsb + width > size:
+            self.statusBar().showMessage(t("field_err_range").format(size=size), 4000)
+            self.bitview.set_register(reg)
+            return
+        for other in reg.fields:
+            if other is not field and not (lsb + width <= other.bit_offset
+                                           or other.bit_offset + other.bit_width <= lsb):
+                self.statusBar().showMessage(
+                    t("field_err_overlap").format(name=other.name), 4000)
+                self.bitview.set_register(reg)
+                return
+        self.undo.beginMacro(t("field_move").format(name=field.name))
+        try:
+            self.undo.push(C.SetAttrCommand(field, "bit_offset", lsb, self._refresh))
+            self.undo.push(C.SetAttrCommand(field, "bit_width", width, self._refresh))
+            self.undo.push(C.SetAttrCommand(field, "lsb", lsb, self._refresh))
+            self.undo.push(C.SetAttrCommand(
+                field, "msb", lsb + width - 1, self._refresh))
+        finally:
+            self.undo.endMacro()
+        self.state.dirty = True
+
+    def _bit_canvas_menu(self, bit: int, global_pos):
+        from PySide6.QtWidgets import QMenu
+        reg = self.bitview.reg
+        if reg is None:
+            return
+        menu = QMenu(self)
+        hit = None
+        if bit >= 0:
+            for field in reg.fields:
+                if field.bit_offset <= bit < field.bit_offset + field.bit_width:
+                    hit = field
+                    break
+        if hit is not None:
+            self._show_object(hit)
+            menu.addAction(t("rename"), self._rename_field_from_menu)
+            menu.addAction(t("delete"), lambda: self._delete_fields([hit]))
+            menu.addSeparator()
+        if bit >= 0 and hit is None:
+            menu.addAction(t("field_new_here").format(bit=bit),
+                           lambda: self._create_field_at_bit(bit))
+        menu.addAction(t("field_batch"), self._batch_add_fields)
+        menu.exec(global_pos)
+
+    def _legend_menu(self, global_pos):
+        from PySide6.QtWidgets import QMenu
+        reg = self.bitview.reg
+        if reg is None:
+            return
+        rows = sorted({i.row() for i in self.bitview.legend.selectedIndexes()})
+        menu = QMenu(self)
+        menu.addAction(t("field_batch"), self._batch_add_fields)
+        if rows:
+            menu.addSeparator()
+            menu.addAction(t("field_delete_multi").format(count=len(rows)),
+                           lambda: self._delete_fields(
+                               [reg.fields[r] for r in rows if 0 <= r < len(reg.fields)]))
+            if len(rows) == 1:
+                menu.addAction(t("rename"), self._rename_field_from_menu)
+        menu.exec(global_pos)
+
+    def _rename_field_from_menu(self):
+        # _bit_canvas_menu already funneled the field through _show_object;
+        # mirror it into the tree so the rename editor opens on the right node
+        from svdstudio.domain.model import SvdField
+        shown = self.props.current_object()
+        if isinstance(shown, SvdField):
+            self._select_object(shown)
+        self.device_tree.edit(self.device_tree.currentIndex())
+
+    def _batch_add_fields(self):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit
+        reg = self.bitview.reg
+        if reg is None:
+            return
+        size = reg.size or 32
+        dialog = QDialog(self)
+        dialog.setWindowTitle(t("field_batch_title"))
+        layout = QFormLayout(dialog)
+        prefix, start, width, count = (QLineEdit("F"), QLineEdit("0"),
+                                      QLineEdit("1"), QLineEdit("8"))
+        layout.addRow(t("field_batch_prefix"), prefix)
+        layout.addRow(t("field_batch_start"), start)
+        layout.addRow(t("field_batch_width"), width)
+        layout.addRow(t("field_batch_count"), count)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        try:
+            start_v, width_v, count_v = (int(start.text().strip(), 0),
+                                        int(width.text().strip(), 0),
+                                        int(count.text().strip(), 0))
+        except ValueError:
+            QMessageBox.warning(self, t("field_batch_title"), t("field_err_numbers"))
+            return
+        if width_v < 1 or count_v < 1 or start_v < 0 \
+                or start_v + count_v * width_v > size:
+            QMessageBox.warning(self, t("field_batch_title"),
+                                t("field_err_range").format(size=size))
+            return
+        existing = {f.name for f in reg.fields}
+        occupied = [(f.bit_offset, f.bit_offset + f.bit_width) for f in reg.fields]
+        plan = []
+        for i in range(count_v):
+            name = f"{prefix.text().strip() or 'F'}{i}"
+            lsb = start_v + i * width_v
+            if name in existing:
+                continue
+            if any(not (lsb + width_v <= a or b <= lsb) for a, b in occupied):
+                QMessageBox.warning(self, t("field_batch_title"),
+                                    t("field_err_overlap").format(name=name))
+                return
+            plan.append((name, lsb))
+            existing.add(name)
+            occupied.append((lsb, lsb + width_v))
+        if not plan:
+            return
+        from svdstudio.domain.svd_defaults import new_field
+        self.undo.beginMacro(t("field_batch_title"))
+        try:
+            for name, lsb in plan:
+                self.undo.push(C.append_command(
+                    reg.fields, new_field(name, lsb, width_v, parent_access=reg.access),
+                    "", self._refresh))
+        finally:
+            self.undo.endMacro()
+        self.state.dirty = True
+        self.statusBar().showMessage(t("field_batch_done").format(count=len(plan)), 4000)
 
     def _refresh(self):
         if not self.state.device:

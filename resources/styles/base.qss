@@ -27,13 +27,19 @@ QComboBox { min-height: 23px; padding: 1px 6px; background: #ffffff; color: #273
 QComboBox:hover { border-color: #9baadb; }
 QComboBox:focus { border-color: #6375d8; }
 QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #cbd5e1; selection-background-color: #e7eaff; selection-color: #33449a; }
+/* cards: thin neutral frame, soft vertical sheen; zones differ by title band */
 QFrame#navigationPanel, QFrame#editorPanel, QFrame#propertiesPanel {
-    background: #ffffff; border: 1px solid #dce3ed; border-radius: 8px; }
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #f7f9fd);
+    border: 1px solid #dbe2ec; border-radius: 10px; }
 QFrame#registerMapPlaceholder, QFrame#bitViewPlaceholder {
-    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #f7f9fc);
-    border: 1px solid #e1e7ef; border-radius: 6px; }
-QLabel#navigationTitle, QLabel#editorTitle, QLabel#propertiesTitle {
-    color: #77869a; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #f6f8fc);
+    border: 1px solid #e0e6ef; border-radius: 8px; }
+QLabel#navigationTitle { color: #4053a4; background: rgba(99,117,216,0.10); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
+QLabel#editorTitle { color: #35795c; background: rgba(93,168,132,0.12); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
+QLabel#propertiesTitle { color: #8a6d2f; background: rgba(201,164,92,0.14); font-size: 9px;
+    font-weight: 700; letter-spacing: 1px; border-radius: 4px; padding: 3px 8px; }
 QLabel#registerMapTitle, QLabel#bitViewTitle { color: #3b4c63; font-size: 10px; font-weight: 700; }
 QLabel#workspaceTitle { color: #34425a; font-size: 16px; font-weight: 700; letter-spacing: 1px; }
 QLabel#workspaceSubtitle { color: #8b98a9; font-size: 9px; }
