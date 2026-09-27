@@ -55,6 +55,8 @@ class MainWindow(QMainWindow):
         self.proxy.setRecursiveFilteringEnabled(True)
         self.device_tree.setModel(self.proxy)
         self.device_tree.clicked.connect(self._select)
+        self.device_tree.doubleClicked.connect(self._rename_at)
+        self.model.renameCommitted.connect(self._rename_from_tree)
         self.device_tree.setIconSize(self.device_tree.iconSize() * 0.9)
         self.search.textChanged.connect(self._on_search_text)
         self.search.returnPressed.connect(self._on_search_return)
@@ -135,6 +137,7 @@ class MainWindow(QMainWindow):
         property_layout = self.property_placeholder.parentWidget().layout()
         property_layout.replaceWidget(self.property_placeholder, self.props)
         self.property_placeholder.deleteLater()
+        self._last_issues = []
 
         self.bitview = BitView()
         self.bit_layout.addWidget(self.bitview)
@@ -149,22 +152,38 @@ class MainWindow(QMainWindow):
             map_layout.layout().setContentsMargins(4, 1, 4, 1)
             map_layout.layout().setSpacing(1)
         self.props.valueEdited.connect(self._edit)
-        self.bitview.fieldClicked.connect(self.props.set_object)
+        self.bitview.fieldClicked.connect(self._show_object)
+        self.bitview.fieldEdited.connect(self._edit_field_from_legend)
         self.bitview.createRequested.connect(self._create_field_at_bit)
         # Eclipse-style problems: double-click jumps, jump icon per row
         self.problems.itemDoubleClicked.connect(lambda _: self._jump_to_problem())
-        # lower tabs take less default height
+        # lower tabs take less default height; small status icons like Eclipse
         lower = self.findChild(QWidget, "lowerTabs")
         if lower is not None:
             lower.setMaximumHeight(220)
+            if hasattr(lower, "setTabIcon"):
+                from PySide6.QtCore import QSize
+                lower.setTabIcon(0, app_icon("warning"))
+                lower.setTabIcon(1, app_icon("info"))
+                lower.setIconSize(QSize(12, 12))
 
     def _configure_layout(self):
         self.workspace_header.hide()
         self.device_tree.setUniformRowHeights(True)
         self.device_tree.setAlternatingRowColors(True)
-        self.device_tree.setExpandsOnDoubleClick(True)
+        # double-click renames (IDE-style); expand via arrows, Enter or menu
+        self.device_tree.setExpandsOnDoubleClick(False)
+        self.device_tree.setEditTriggers(
+            self.device_tree.EditTrigger.DoubleClicked
+            | self.device_tree.EditTrigger.EditKeyPressed)
         self.device_tree.setAnimated(True)
         self.device_tree.setIndentation(16)
+        self.device_tree.setSelectionMode(self.device_tree.SelectionMode.ExtendedSelection)
+        self.device_tree.installEventFilter(self)
+        map_view = self.findChild(QWidget, "registerMapView")
+        if map_view is not None:
+            map_view.installEventFilter(self)
+        self.bitview.legend.installEventFilter(self)
         self.props.setAlternatingRowColors(True)
         self.problems.setAlternatingRowColors(True)
         self.main_splitter.setStretchFactor(0, 1)
@@ -176,6 +195,7 @@ class MainWindow(QMainWindow):
         self.device_tree.customContextMenuRequested.connect(self._tree_menu)
         self.device_tree.expanded.connect(lambda _: self._sync_breadcrumb())
         self._apply_texts()
+        self._retranslate_panels()
 
     def _apply_texts(self):
         self.setWindowTitle(t("app"))
@@ -205,6 +225,90 @@ class MainWindow(QMainWindow):
             cursor = cursor.parent
         self.statusBar().showMessage("  /  ".join(reversed([p for p in parts if p])))
 
+    def eventFilter(self, watched, event):
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Delete:
+            map_view = self.findChild(QWidget, "registerMapView")
+            if watched is map_view:
+                target = self._map_target()
+                view = watched
+                rows = sorted({i.row() for i in view.selectedIndexes()}) \
+                    if hasattr(view, "selectedIndexes") else []
+                if target is not None and rows:
+                    self._map_delete_selected(target, rows)
+                    return True
+            if watched is self.bitview.legend:
+                rows = sorted({i.row() for i in self.bitview.legend.selectedIndexes()},
+                              reverse=True)
+                regs = self.bitview.reg
+                targets = [regs.fields[r] for r in rows
+                           if regs is not None and 0 <= r < len(regs.fields)]
+                if targets:
+                    self._delete_fields(targets)
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _delete_fields(self, targets):
+        answer = QMessageBox.question(
+            self, t("delete"),
+            t("delete_confirm_multi").format(
+                count=len(targets),
+                names=", ".join(getattr(f, "name", "?") for f in targets[:8])))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        reg = self.bitview.reg
+        if reg is None:
+            return
+        self.undo.beginMacro(t("delete"))
+        try:
+            order = {id(f): i for i, f in enumerate(reg.fields)}
+            for field in sorted(targets, key=lambda f: order.get(id(f), -1), reverse=True):
+                if field in reg.fields:
+                    self.undo.push(C.DeleteCommand(reg.fields, field, "", self._refresh))
+        finally:
+            self.undo.endMacro()
+        self.state.dirty = True
+
+    def _rename_at(self, proxy_index=None):
+        """Open the in-place rename editor for a tree node (double-click / F2)."""
+        index = proxy_index if proxy_index is not None else self.device_tree.currentIndex()
+        if not index.isValid():
+            return
+        source = self.proxy.mapToSource(index)
+        node = source.internalPointer() if source.isValid() else None
+        if node is None or node.obj is None or not hasattr(node.obj, "name"):
+            return
+        self.device_tree.edit(index)
+
+    def _rename_from_tree(self, obj, new: str):
+        """Validate a tree rename and route it through the undo stack."""
+        if not new or new == getattr(obj, "name", ""):
+            return
+        if self._sibling_names(obj) is not None and new in self._sibling_names(obj):
+            self.statusBar().showMessage(t("rename_dup"), 4000)
+            return
+        old = getattr(obj, "name", "")
+        self.undo.push(C.SetAttrCommand(obj, "name", new, self._refresh))
+        self.state.dirty = True
+        self.statusBar().showMessage(t("rename_done").format(old=old, new=new), 4000)
+
+    def _sibling_names(self, obj):
+        """Names of objects sharing the same model parent (for rename checks)."""
+        from PySide6.QtCore import QModelIndex
+
+        def walk(parent):
+            for row in range(self.model.rowCount(parent)):
+                idx = self.model.index(row, 0, parent)
+                node = idx.internalPointer()
+                if node is not None and node.obj is obj and node.parent is not None:
+                    return {getattr(sib.obj, "name", "") for sib in node.parent.children
+                            if sib.obj is not None and sib.obj is not obj}
+                found = walk(idx)
+                if found is not None:
+                    return found
+            return None
+        return walk(QModelIndex())
+
     def _tree_menu(self, pos):
         from PySide6.QtWidgets import QMenu
         index = self.device_tree.indexAt(pos)
@@ -212,6 +316,8 @@ class MainWindow(QMainWindow):
             self.device_tree.setCurrentIndex(index)
             self._select(index)
         menu = QMenu(self)
+        menu.addAction(t("rename"), self._rename_at)
+        menu.addSeparator()
         menu.addAction(t("add"), self.add_selected_child)
         menu.addAction(t("duplicate"), self.duplicate_selected)
         menu.addAction(t("delete"), self.delete_selected)
@@ -240,7 +346,7 @@ class MainWindow(QMainWindow):
         actions = (
             ("open", "open", self.open, QKeySequence.StandardKey.Open),
             ("save", "save", self.save, QKeySequence.StandardKey.Save),
-            ("new_device", None, self.new_device, QKeySequence.StandardKey.New),
+            ("new_device", "new", self.new_device, QKeySequence.StandardKey.New),
             ("validate", "validate", self.revalidate, QKeySequence(Qt.Key.Key_F5)),
             ("__group_break__", None, None, None),
             ("undo", "undo", self.undo.undo, QKeySequence.StandardKey.Undo),
@@ -253,10 +359,10 @@ class MainWindow(QMainWindow):
             ("diff", "diff", self.run_diff, None),
             ("overlay", "validate", self.run_overlay, None),
             ("batch", "register_map", self.run_batch, None),
-            ("move_up", None, lambda: self.move_selected(-1), None),
-            ("move_down", None, lambda: self.move_selected(1), None),
-            ("copy", None, self.copy_selected, QKeySequence.StandardKey.Copy),
-            ("paste", None, self.paste_selected, QKeySequence.StandardKey.Paste),
+            ("move_up", "move_up", lambda: self.move_selected(-1), None),
+            ("move_down", "move_down", lambda: self.move_selected(1), None),
+            ("copy", "copy", self.copy_selected, QKeySequence.StandardKey.Copy),
+            ("paste", "paste", self.paste_selected, QKeySequence.StandardKey.Paste),
             ("theme", "theme", self.toggle_theme, None),
         )
         self.actions = {}
@@ -372,6 +478,28 @@ class MainWindow(QMainWindow):
         self.menuBar().clear()
         self._rebuild_menus()
         self._apply_texts()
+        self._retranslate_panels()
+
+    def _retranslate_panels(self):
+        """Retranslate every panel so a language switch is truly global."""
+        titles = {
+            "navigationTitle": "explorer",
+            "editorTitle": "register_map",
+            "propertiesTitle": "properties",
+        }
+        for name, key in titles.items():
+            label = self.findChild(QLabel, name)
+            if label is not None:
+                label.setText(t(key))
+        lower = self.findChild(QWidget, "lowerTabs")
+        if lower is not None and hasattr(lower, "setTabText"):
+            lower.setTabText(0, t("problems"))
+            lower.setTabText(1, t("output"))
+        self.props.refresh()
+        self.bitview.retranslate()
+        if self._selected_node is not None:
+            self._update_register_map(self._selected_node.obj)
+            self._update_status(self._selected_node)
 
     def show_about(self):
         QMessageBox.about(
@@ -419,7 +547,7 @@ class MainWindow(QMainWindow):
 
     def _clear_detail_panels(self):
         """Empty map/bitview/props/problems when the device context changes."""
-        self.props.set_object(None)
+        self._show_object(None)
         self.bitview.set_register(None)
         view = self.findChild(QWidget, "registerMapView")
         if view is not None and hasattr(view, "setModel"):
@@ -612,6 +740,12 @@ class MainWindow(QMainWindow):
         node = source_index.internalPointer() if source_index.isValid() else None
         if node is None:
             return
+        if (self._selected_node is not None and self._selected_node.obj is node.obj
+                and self._selected_node.obj is not None):
+            # same object re-clicked (e.g. second half of a double-click):
+            # do NOT rebuild the map/model or the in-place editor never opens
+            self._sync_breadcrumb()
+            return
         self._selected_node = node
         # keep the path visible without manual scrolling
         parent = index.parent()
@@ -619,7 +753,7 @@ class MainWindow(QMainWindow):
             if not self.device_tree.isExpanded(parent):
                 self.device_tree.expand(parent)
             parent = parent.parent()
-        self.props.set_object(node.obj)
+        self._show_object(node.obj)
         self.bitview.set_register(node.obj if isinstance(node.obj, SvdRegister) else None)
         self._update_register_map(node.obj)
         self._update_status(node)
@@ -659,22 +793,36 @@ class MainWindow(QMainWindow):
         if target is None:
             return
         from PySide6.QtWidgets import QHeaderView as _HV
-        model = QStandardItemModel(0, 5)
-        model.setHorizontalHeaderLabels([t("offset"), t("name"), t("access"), t("reset"), t("description")])
-        for reg in sorted(target.registers, key=lambda r: r.address_offset):
-            abs_addr = target.base_address + reg.address_offset
-            model.appendRow([
-                QStandardItem(f"{reg.address_offset:#06x}  ({abs_addr:#010x})"),
-                QStandardItem(reg.name),
-                QStandardItem(reg.access or "—"),
-                QStandardItem(f"{reg.reset_value:#010x}"),
-                QStandardItem(reg.description or ""),
-            ])
+        self._map_loading = True
+        try:
+            model = QStandardItemModel(0, 5)
+            model.setHorizontalHeaderLabels([t("offset"), t("name"), t("access"), t("reset"), t("description")])
+            for reg in sorted(target.registers, key=lambda r: r.address_offset):
+                abs_addr = target.base_address + reg.address_offset
+                cells = [
+                    QStandardItem(f"{reg.address_offset:#06x}  ({abs_addr:#010x})"),
+                    QStandardItem(reg.name),
+                    QStandardItem(reg.access or "—"),
+                    QStandardItem(f"{reg.reset_value:#010x}"),
+                    QStandardItem(reg.description or ""),
+                ]
+                for cell in cells:
+                    cell.setEditable(True)
+                    cell.setData(reg, Qt.ItemDataRole.UserRole)
+                cells[0].setToolTip(t("map_tip_offset"))
+                cells[1].setToolTip(t("map_tip_name"))
+                cells[2].setToolTip(t("map_tip_access"))
+                cells[3].setToolTip(t("map_tip_reset"))
+                model.appendRow(cells)
+        finally:
+            self._map_loading = False
         view.setModel(model)
+        model.itemChanged.connect(self._on_map_item_changed)
         view.setAlternatingRowColors(True)
         view.setSelectionBehavior(view.SelectionBehavior.SelectRows)
         view.setSelectionMode(view.SelectionMode.ExtendedSelection)
-        view.setEditTriggers(view.EditTrigger.NoEditTriggers)
+        view.setEditTriggers(view.EditTrigger.DoubleClicked | view.EditTrigger.EditKeyPressed
+                             | view.EditTrigger.AnyKeyPressed)
         header = view.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
@@ -718,6 +866,49 @@ class MainWindow(QMainWindow):
             return
         self._register_map_menu(target, view.mapToGlobal(pos))
 
+    def _on_map_item_changed(self, item):
+        """Commit an in-place register-map edit through the undo stack."""
+        if getattr(self, "_map_loading", False):
+            return
+        reg = item.data(Qt.ItemDataRole.UserRole)
+        if reg is None:
+            return
+        col = item.column()
+        text = item.text().strip()
+        target = self._map_target()
+        try:
+            if col == 0:
+                new = int(text.split()[0], 0)
+                if new != reg.address_offset:
+                    self.undo.push(C.SetAttrCommand(reg, "address_offset", new, self._refresh))
+                    self.state.dirty = True
+            elif col == 1:
+                if not text:
+                    raise ValueError(t("map_err_empty_name"))
+                if any(r is not reg and r.name == text for r in (target.registers if target else [])):
+                    raise ValueError(t("map_err_dup_name"))
+                if text != reg.name:
+                    self.undo.push(C.SetAttrCommand(reg, "name", text, self._refresh))
+                    self.state.dirty = True
+            elif col == 2:
+                value = "" if text in ("—", "-", "") else text
+                if value != (reg.access or ""):
+                    self.undo.push(C.SetAttrCommand(reg, "access", value, self._refresh))
+                    self.state.dirty = True
+            elif col == 3:
+                new = int(text, 0)
+                if new != reg.reset_value:
+                    self.undo.push(C.SetAttrCommand(reg, "reset_value", new, self._refresh))
+                    self.state.dirty = True
+            elif col == 4:
+                if text != (reg.description or ""):
+                    self.undo.push(C.SetAttrCommand(reg, "description", text, self._refresh))
+                    self.state.dirty = True
+        except ValueError as error:
+            # revert the cell; _refresh rebuilds the map from the domain anyway
+            self._refresh()
+            self.statusBar().showMessage(str(error), 4000)
+
     def _map_target(self):
         from svdstudio.domain.model import SvdPeripheral
         node = self._selected_node
@@ -732,89 +923,6 @@ class MainWindow(QMainWindow):
                     return cursor.obj
                 cursor = cursor.parent
         return getattr(self, "_map_peripheral", None)
-
-    def _map_add(self):
-        target = self._map_target()
-        if target is None:
-            QMessageBox.information(self, "寄存器地图", "请先在左侧选中一个外设或其寄存器。")
-            return
-        from svdstudio.ui.create_dialogs import RegisterDialog
-        dialog = RegisterDialog(self)
-        if dialog.exec() != dialog.DialogCode.Accepted:
-            return
-        try:
-            name, offset, size, access, reset, desc = dialog.parsed()
-        except ValueError as error:
-            QMessageBox.warning(self, "新建寄存器", str(error))
-            return
-        if any(r.name == name for r in target.registers):
-            QMessageBox.warning(self, "新建寄存器", f"寄存器 {name} 已存在")
-            return
-        from svdstudio.domain.svd_defaults import new_register
-        reg = new_register(name, offset, description=desc, size=size,
-                           access=access or "read-write", reset_value=reset)
-        self.undo.push(C.append_command(target.registers, reg, f"新建寄存器 {name}", self._refresh))
-        self.state.dirty = True
-
-    def _map_batch_add(self):
-        target = self._map_target()
-        if target is None:
-            QMessageBox.information(self, "寄存器地图", "请先在左侧选中一个外设或其寄存器。")
-            return
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit
-        dialog = QDialog(self)
-        dialog.setWindowTitle("批量添加寄存器")
-        layout = QFormLayout(dialog)
-        prefix, start, step, count = QLineEdit("REG"), QLineEdit("0x0"), QLineEdit("0x4"), QLineEdit("4")
-        layout.addRow("前缀", prefix)
-        layout.addRow("起始偏移", start)
-        layout.addRow("步进", step)
-        layout.addRow("数量", count)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
-                                   | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != dialog.DialogCode.Accepted:
-            return
-        try:
-            start_v, step_v, count_v = int(start.text().strip(), 0), int(step.text().strip(), 0), \
-                int(count.text().strip(), 0)
-        except ValueError:
-            QMessageBox.warning(self, "批量添加", "偏移/步进/数量必须是数字")
-            return
-        added = 0
-        for i in range(max(1, min(count_v, 256))):
-            name = f"{prefix.text().strip() or 'REG'}{i}"
-            if any(r.name == name for r in target.registers):
-                continue
-            from svdstudio.domain.svd_defaults import new_register as _new_reg
-            self.undo.push(C.append_command(
-                target.registers, _new_reg(name, start_v + i * step_v),
-                f"新建寄存器 {name}", self._refresh))
-            added += 1
-        self.state.dirty = True
-        self.statusBar().showMessage(f"批量添加 {added} 个寄存器")
-
-    def _map_delete_selected(self):
-        target = self._map_target()
-        view = self.findChild(QWidget, "registerMapView")
-        if target is None or view is None or not hasattr(view, "selectionModel"):
-            return
-        rows = sorted({idx.row() for idx in view.selectionModel().selectedRows()}, reverse=True)
-        if not rows:
-            QMessageBox.information(self, "寄存器地图", "请先在地图中选中要删除的行（支持多选）。")
-            return
-        regs = sorted(target.registers, key=lambda r: r.address_offset)
-        names = [regs[r].name for r in rows if 0 <= r < len(regs)]
-        answer = QMessageBox.question(self, "删除", f"删除 {len(names)} 个寄存器？\n" + ", ".join(names[:8]))
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        for r in rows:
-            if 0 <= r < len(regs):
-                self.undo.push(C.DeleteCommand(target.registers, regs[r],
-                                               f"删除 {regs[r].name}", self._refresh))
-        self.state.dirty = True
 
     def _select_register_from_map(self, peripheral, row: int):
         regs = sorted(peripheral.registers, key=lambda r: r.address_offset)
@@ -836,7 +944,7 @@ class MainWindow(QMainWindow):
         menu.exec(global_pos)
 
     def _map_add_register(self, peripheral):
-        from svdstudio.domain.model import SvdRegister
+        from svdstudio.domain.svd_defaults import new_register
         from svdstudio.ui.create_dialogs import RegisterDialog
         dialog = RegisterDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -849,8 +957,8 @@ class MainWindow(QMainWindow):
         if any(r.name == name for r in peripheral.registers):
             QMessageBox.warning(self, "新建寄存器", f"寄存器 {name} 已存在")
             return
-        reg = SvdRegister(name=name, description=desc, address_offset=offset, size=size,
-                          access=access, reset_value=reset)
+        reg = new_register(name, offset, description=desc, size=size,
+                           access=access or "read-write", reset_value=reset)
         self.undo.push(C.append_command(peripheral.registers, reg, f"新建寄存器 {name}", self._refresh))
         self.state.dirty = True
         self._select_object(reg)
@@ -886,9 +994,9 @@ class MainWindow(QMainWindow):
             name = f"{prefix.text().strip() or 'REG'}{i}"
             if name in existing:
                 continue
-            from svdstudio.domain.model import SvdRegister
+            from svdstudio.domain.svd_defaults import new_register
             self.undo.push(C.append_command(
-                peripheral.registers, SvdRegister(name=name, address_offset=base + i * stride),
+                peripheral.registers, new_register(name, base + i * stride),
                 f"新建寄存器 {name}", self._refresh))
             existing.add(name)
             added += 1
@@ -1120,8 +1228,20 @@ class MainWindow(QMainWindow):
             extra = f"  bit {node.obj.lsb}" if node.obj.bit_width == 1 else f"  bits {node.obj.msb}:{node.obj.lsb}"
         self.statusBar().showMessage(f"{chain}{extra}" if chain else "Ready")
 
+    def _show_object(self, obj):
+        """Single funnel for the property panel so every selection path stays in sync."""
+        self.props.set_object(obj)
+
     def _edit(self, obj, attr, new):
+        old = getattr(obj, attr, "")
         self.undo.push(C.SetAttrCommand(obj, attr, new, self._refresh))
+        self.state.dirty = True
+        shown_old = f"{old:#x}" if isinstance(old, int) else old
+        shown_new = f"{new:#x}" if isinstance(new, int) else new
+        self.statusBar().showMessage(f"已更新 {attr}: {shown_old} → {shown_new}", 4000)
+
+    def _edit_field_from_legend(self, field, attr, new):
+        self.undo.push(C.SetAttrCommand(field, attr, new, self._refresh))
         self.state.dirty = True
 
     def _refresh(self):
@@ -1156,7 +1276,7 @@ class MainWindow(QMainWindow):
         restore(QModelIndex())
         # re-sync detail panels so map/bitview/props follow the mutation
         if self._selected_node is not None:
-            self.props.set_object(self._selected_node.obj)
+            self._show_object(self._selected_node.obj)
             from svdstudio.domain.model import SvdRegister as _SR
             self.bitview.set_register(
                 self._selected_node.obj if isinstance(self._selected_node.obj, _SR) else None)
@@ -1182,11 +1302,7 @@ class MainWindow(QMainWindow):
     def add_selected_child(self):
         """Context-aware creation: device->peripheral, peripheral->register/cluster,
         cluster->register, register->field, field->enum. All validated + undoable."""
-        from svdstudio.domain.model import (
-            SvdCluster,
-            SvdPeripheral,
-            SvdRegister,
-        )
+        from svdstudio.domain.model import SvdCluster, SvdPeripheral, SvdRegister
         from svdstudio.ui.create_dialogs import (
             FieldDialog,
             PeripheralDialog,
@@ -1214,8 +1330,9 @@ class MainWindow(QMainWindow):
                 if any(r.name == name for r in obj.registers):
                     QMessageBox.warning(self, t("add"), f"寄存器 {name} 已存在。")
                     return
-                item = SvdRegister(name=name, address_offset=offset, size=size,
-                                   access=access, reset_value=reset, description=desc)
+                from svdstudio.domain.svd_defaults import new_register
+                item = new_register(name, offset, size=size, access=access or "read-write",
+                                    reset_value=reset, description=desc)
                 self.undo.push(C.append_command(obj.registers, item,
                                                 f"新建寄存器 {name}", self._refresh))
             elif isinstance(obj, SvdCluster):
@@ -1223,8 +1340,8 @@ class MainWindow(QMainWindow):
                 if dialog.exec() != dialog.DialogCode.Accepted:
                     return
                 name, offset, size, access, reset, desc = dialog.parsed()
-                item = SvdRegister(name=name, address_offset=offset, size=size,
-                                   access=access, reset_value=reset, description=desc)
+                item = new_register(name, offset, size=size, access=access or "read-write",
+                                    reset_value=reset, description=desc)
                 self.undo.push(C.append_command(obj.registers, item,
                                                 f"新建寄存器 {name}", self._refresh))
             elif isinstance(obj, SvdRegister):
@@ -1288,14 +1405,85 @@ class MainWindow(QMainWindow):
         self.undo.push(C.InsertCommand(items, item, len(items), f"Duplicate {item.name}", self._refresh))
         self.state.dirty = True
 
+    def _tree_deletables(self):
+        """All selected tree nodes that can be deleted, as (items, obj) pairs.
+
+        Ctrl+click / Shift+click multi-selection is supported; children of a
+        selected parent are skipped so each object is deleted exactly once.
+        """
+        from svdstudio.domain.model import SvdCluster, SvdField, SvdPeripheral, SvdRegister
+        selected = self.device_tree.selectionModel().selectedRows()
+        nodes = []
+        for proxy_idx in selected:
+            source = self.proxy.mapToSource(proxy_idx)
+            node = source.internalPointer() if source.isValid() else None
+            if node is not None and node.obj is not None:
+                nodes.append(node)
+        if self._selected_node is not None and not nodes:
+            nodes = [self._selected_node]
+        node_ids = {id(n) for n in nodes}
+        pairs = []
+        for node in nodes:
+            ancestor_selected = False
+            cursor = node.parent
+            while cursor is not None:
+                if id(cursor) in node_ids:
+                    ancestor_selected = True
+                    break
+                cursor = cursor.parent
+            if ancestor_selected:
+                continue
+            items = None
+            if isinstance(node.obj, SvdPeripheral):
+                items = self.state.device.peripherals if self.state.device else None
+            elif isinstance(node.obj, SvdCluster) and node.parent is not None:
+                parent_obj = node.parent.obj
+                if isinstance(parent_obj, (SvdPeripheral, SvdCluster)):
+                    items = parent_obj.clusters
+            elif isinstance(node.obj, SvdRegister) and node.parent is not None:
+                parent_obj = node.parent.obj
+                if isinstance(parent_obj, (SvdPeripheral, SvdCluster)):
+                    items = parent_obj.registers
+            elif isinstance(node.obj, SvdField) and node.parent is not None \
+                    and isinstance(node.parent.obj, SvdRegister):
+                items = node.parent.obj.fields
+            if items is not None and node.obj in items:
+                pairs.append((items, node.obj))
+        return pairs
+
     def delete_selected(self):
-        items = self._selected_collection()
-        if items is None:
+        # Delete is context-aware: map/legend handle their own rows via eventFilter
+        map_view = self.findChild(QWidget, "registerMapView")
+        if map_view is not None and map_view.hasFocus() and hasattr(map_view, "selectedIndexes") \
+                and map_view.selectedIndexes():
             return
-        item = self._selected_node.obj
-        answer = QMessageBox.question(self, "Delete object", f"Delete {item.name}?")
+        if self.bitview.legend.hasFocus() and self.bitview.legend.selectedIndexes():
+            return
+        pairs = self._tree_deletables()
+        if not pairs:
+            return
+        names = [getattr(obj, "name", "?") for _, obj in pairs]
+        answer = QMessageBox.question(
+            self, t("delete"),
+            t("delete_confirm_multi").format(count=len(pairs), names=", ".join(names[:8])))
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.undo.push(C.DeleteCommand(items, item, f"Delete {item.name}", self._refresh))
+        deleted = {id(obj) for _, obj in pairs}
+        self.undo.beginMacro(t("delete"))
+        try:
+            by_list: dict[int, tuple[list, list]] = {}
+            for items, obj in pairs:
+                by_list.setdefault(id(items), (items, []))[1].append(obj)
+            for items, objs in by_list.values():
+                order = {id(o): i for i, o in enumerate(items)}
+                for obj in sorted(objs, key=lambda o: order.get(id(o), -1), reverse=True):
+                    if obj in items:
+                        self.undo.push(C.DeleteCommand(items, obj, "", self._refresh))
+        finally:
+            self.undo.endMacro()
         self.state.dirty = True
+        if self._selected_node is not None and id(self._selected_node.obj) in deleted:
+            self._selected_node = None
+            self._show_object(None)
+            self.bitview.set_register(None)
 

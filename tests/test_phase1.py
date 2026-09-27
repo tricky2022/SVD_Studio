@@ -142,6 +142,25 @@ def test_all_icons_valid():
     _ = app
 
 
+def test_tree_labels_follow_renames_live():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from svdstudio.domain.model import SvdDevice, SvdPeripheral
+    from svdstudio.ui.tree_model import DeviceTreeModel
+    dev = SvdDevice(name="D", peripherals=[SvdPeripheral(name="GPIOA", base_address=0)])
+    model = DeviceTreeModel(dev)
+    device_index = model.index(0, 0)
+    periphs_index = model.index(1, 0, device_index)
+    periph_index = model.index(0, 0, periphs_index)
+    assert model.data(periph_index, Qt.ItemDataRole.DisplayRole) == "GPIOA"
+    dev.peripherals[0].name = "GPIOB"
+    assert model.data(periph_index, Qt.ItemDataRole.DisplayRole) == "GPIOB"
+    _ = app
+
+
 def test_overlay_yaml_roundtrip(tmp_path):
     from svdstudio.domain import overlay_file as OF
     path = str(tmp_path / "ov.yaml")

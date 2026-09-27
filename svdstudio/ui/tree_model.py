@@ -1,7 +1,7 @@
 """Domain-backed tree model for the device explorer."""
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 
 from svdstudio.domain.model import (
     EnumeratedValues,
@@ -10,6 +10,19 @@ from svdstudio.domain.model import (
     SvdPeripheral,
     SvdRegister,
 )
+
+# muted flat icon tones: dusty pastels, no neon, consistent across themes
+FLAT_TONES = {
+    "device": "#8ea3c2",
+    "cpu": "#c29585",
+    "peripherals": "#8ea3c2",
+    "peripheral": "#7ba7d4",
+    "cluster": "#c3ac7c",
+    "register": "#82b894",
+    "field": "#a895c7",
+    "enum": "#c7a06a",
+    "enum_value": "#9fb3c8",
+}
 
 
 class _Node:
@@ -24,6 +37,10 @@ class _Node:
 
 
 class DeviceTreeModel(QAbstractItemModel):
+    # emitted when an in-place tree rename is committed; the window validates
+    # (non-empty, sibling-unique) and routes it through the undo stack
+    renameCommitted = Signal(object, str)
+
     def __init__(self, dev: SvdDevice | None = None):
         super().__init__()
         self.root = _Node("root")
@@ -100,33 +117,55 @@ class DeviceTreeModel(QAbstractItemModel):
     def columnCount(self, parent=None):
         return 1
 
+    def flags(self, index):
+        base = super().flags(index)
+        if not index.isValid():
+            return base
+        node: _Node = index.internalPointer()
+        if node.obj is not None and hasattr(node.obj, "name"):
+            return base | Qt.ItemFlag.ItemIsEditable
+        return base
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if role != Qt.ItemDataRole.EditRole or not index.isValid():
+            return False
+        node: _Node = index.internalPointer()
+        if node.obj is None or not hasattr(node.obj, "name"):
+            return False
+        text = str(value).strip()
+        if not text or text == getattr(node.obj, "name", ""):
+            return False
+        self.renameCommitted.emit(node.obj, text)
+        return True
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
         node: _Node = index.internalPointer()
         if role == Qt.ItemDataRole.DisplayRole:
-            return node.label
+            # live name: property renames reflect instantly without a model reset
+            return getattr(node.obj, "name", None) or node.label
         if role == Qt.ItemDataRole.DecorationRole:
             from svdstudio.domain.model import SvdField
             from svdstudio.ui.icons import icon
             o = node.obj
             if isinstance(o, SvdDevice):
-                return icon("device", "#7fb3e8")
+                return icon("device", FLAT_TONES["device"])
             if isinstance(o, SvdPeripheral):
-                return icon("peripheral", "#7fb3e8")
+                return icon("peripheral", FLAT_TONES["peripheral"])
             if isinstance(o, SvdCluster):
-                return icon("cluster", "#c9a86a")
+                return icon("cluster", FLAT_TONES["cluster"])
             if isinstance(o, SvdRegister):
-                return icon("register", "#6fd3a7")
+                return icon("register", FLAT_TONES["register"])
             if isinstance(o, SvdField):
-                return icon("field", "#b39ddb")
+                return icon("field", FLAT_TONES["field"])
             if isinstance(o, EnumeratedValues):
-                return icon("enum", "#e0a458")
+                return icon("enum", FLAT_TONES["enum"])
             if o is None and node.label == "Peripherals":
-                return icon("peripherals", "#7fb3e8")
+                return icon("peripherals", FLAT_TONES["peripherals"])
             if node.label == "CPU":
-                return icon("cpu", "#e07a7a")
-            return icon("enum_value", "#9fb3c8")
+                return icon("cpu", FLAT_TONES["cpu"])
+            return icon("enum_value", FLAT_TONES["enum_value"])
         if role == Qt.ItemDataRole.ForegroundRole:
             prov = getattr(getattr(node.obj, "meta", None), "provenance", None)
             from PySide6.QtGui import QColor

@@ -7,31 +7,35 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
-# group -> ordered attrs per domain type
+from svdstudio.ui.i18n import t
+
+# group -> ordered attrs per domain type (group titles are i18n keys)
 GROUPS: dict[str, list[tuple[str, list[str]]]] = {
     "SvdDevice": [
-        ("标识", ["name", "vendor", "vendor_id", "series", "version", "description", "license_text"]),
-        ("地址与宽度", ["address_unit_bits", "width", "size", "access", "protection",
-                        "reset_value", "reset_mask"]),
+        ("g_identity", ["name", "vendor", "vendor_id", "series", "version", "description",
+                        "license_text"]),
+        ("g_addrwidth", ["address_unit_bits", "width", "size", "access", "protection",
+                         "reset_value", "reset_mask"]),
     ],
     "SvdPeripheral": [
-        ("标识", ["name", "display_name", "description", "group_name", "header_struct_name",
-                  "prepend_to_name", "append_to_name"]),
-        ("地址", ["base_address", "derived_from"]),
+        ("g_identity", ["name", "display_name", "description", "group_name", "header_struct_name",
+                        "prepend_to_name", "append_to_name"]),
+        ("g_address", ["base_address", "derived_from"]),
     ],
     "SvdRegister": [
-        ("标识", ["name", "display_name", "description", "alternate_register", "derived_from"]),
-        ("地址", ["address_offset", "size"]),
-        ("访问", ["access", "protection", "read_action", "modified_write_values", "write_constraint"]),
-        ("复位", ["reset_value", "reset_mask"]),
+        ("g_identity", ["name", "display_name", "description", "alternate_register", "derived_from"]),
+        ("g_address", ["address_offset", "size"]),
+        ("g_access", ["access", "protection", "read_action", "modified_write_values",
+                      "write_constraint"]),
+        ("g_reset", ["reset_value", "reset_mask"]),
     ],
     "SvdField": [
-        ("标识", ["name", "description", "derived_from"]),
-        ("位域", ["bit_offset", "bit_width", "lsb", "msb"]),
-        ("访问", ["access", "read_action", "modified_write_values", "write_constraint"]),
-        ("复位", ["reset_value"]),
+        ("g_identity", ["name", "description", "derived_from"]),
+        ("g_bitfield", ["bit_offset", "bit_width", "lsb", "msb"]),
+        ("g_access", ["access", "read_action", "modified_write_values", "write_constraint"]),
+        ("g_reset", ["reset_value"]),
     ],
-    "default": [("属性", [])],
+    "default": [("g_default", [])],
 }
 
 # SVD-standard closed value sets -> combo boxes instead of free text
@@ -47,24 +51,27 @@ CHOICES: dict[str, list[str]] = {
 
 # category accent color per property group (module-level: immutable usage)
 CATEGORY_COLORS = {
-    "地址": "#4a7ab0",
-    "访问": "#3f9e6b",
-    "复位": "#b7791f",
-    "位域": "#8b6fc0",
-    "地址与宽度": "#4a7ab0",
+    "g_address": "#4a7ab0",
+    "g_access": "#3f9e6b",
+    "g_reset": "#b7791f",
+    "g_bitfield": "#8b6fc0",
+    "g_addrwidth": "#4a7ab0",
 }
 
-LABELS = {
-    "name": "名称", "display_name": "显示名", "description": "描述",
-    "address_offset": "偏移", "base_address": "基地址", "size": "位宽",
-    "access": "访问", "protection": "保护", "reset_value": "复位值", "reset_mask": "复位掩码",
-    "read_action": "读动作", "modified_write_values": "写语义", "write_constraint": "写约束",
-    "bit_offset": "起始位", "bit_width": "位宽", "lsb": "LSB", "msb": "MSB",
-    "derived_from": "继承自", "alternate_register": "别名寄存器",
-    "group_name": "分组", "header_struct_name": "结构体名",
-    "prepend_to_name": "名称前缀", "append_to_name": "名称后缀",
-    "vendor": "厂商", "vendor_id": "厂商ID", "series": "系列", "version": "版本",
-    "license_text": "许可", "address_unit_bits": "地址单元", "width": "宽度",
+# attribute -> i18n key; t() resolves the display text at render time
+LABEL_KEYS = {
+    "name": "l_name", "display_name": "l_display_name", "description": "l_description",
+    "address_offset": "l_address_offset", "base_address": "l_base_address", "size": "l_size",
+    "access": "l_access", "protection": "l_protection", "reset_value": "l_reset_value",
+    "reset_mask": "l_reset_mask", "read_action": "l_read_action",
+    "modified_write_values": "l_modified_write_values", "write_constraint": "l_write_constraint",
+    "bit_offset": "l_bit_offset", "bit_width": "l_bit_width", "lsb": "l_lsb", "msb": "l_msb",
+    "derived_from": "l_derived_from", "alternate_register": "l_alternate_register",
+    "group_name": "l_group_name", "header_struct_name": "l_header_struct_name",
+    "prepend_to_name": "l_prepend_to_name", "append_to_name": "l_append_to_name",
+    "vendor": "l_vendor", "vendor_id": "l_vendor_id", "series": "l_series",
+    "version": "l_version", "license_text": "l_license_text",
+    "address_unit_bits": "l_address_unit_bits", "width": "l_width",
 }
 
 
@@ -73,8 +80,10 @@ class PropertyEditor(QTableWidget):
 
     def __init__(self):
         super().__init__(0, 2)
-        self.setHorizontalHeaderLabels(["属性", "值"])
-        self.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        self.setHorizontalHeaderLabels([t("property"), t("value")])
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                             | QAbstractItemView.EditTrigger.EditKeyPressed
+                             | QAbstractItemView.EditTrigger.AnyKeyPressed)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setAlternatingRowColors(True)
@@ -83,15 +92,16 @@ class PropertyEditor(QTableWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setStretchLastSection(True)
-        header.setMinimumSectionSize(110)
-        self.setColumnWidth(0, 150)
+        header.setMinimumSectionSize(130)
+        self.setColumnWidth(0, 175)
         self._obj = None
         self._loading = False
         self._row_attr: list[str | None] = []
         self.cellChanged.connect(self._on_cell)
 
     def refresh(self):
-        """Re-render with current palette (call after theme switch)."""
+        """Re-render with current palette and language."""
+        self.setHorizontalHeaderLabels([t("property"), t("value")])
         self.set_object(self._obj)
 
     def set_object(self, obj):
@@ -120,10 +130,10 @@ class PropertyEditor(QTableWidget):
         self.resizeRowsToContents()
         self._loading = False
 
-    def _add_section(self, title: str):
+    def _add_section(self, title_key: str):
         row = self.rowCount()
         self.insertRow(row)
-        item = QTableWidgetItem(f"▾  {title}")
+        item = QTableWidgetItem(f"▾  {t(title_key)}")
         font = QFont(self.font())
         font.setBold(True)
         item.setFont(font)
@@ -150,7 +160,7 @@ class PropertyEditor(QTableWidget):
             return
         row = self.rowCount()
         self.insertRow(row)
-        name_item = QTableWidgetItem(LABELS.get(attr, attr))
+        name_item = QTableWidgetItem(t(LABEL_KEYS.get(attr, attr)))
         name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         name_item.setToolTip(attr)
         accent = CATEGORY_COLORS.get(group)
@@ -198,17 +208,26 @@ class PropertyEditor(QTableWidget):
         if row >= len(self._row_attr) or self._row_attr[row] is None:
             return
         attr = self._row_attr[row]
-        text = self.item(row, 1).text().strip()
+        cell = self.item(row, 1)
+        text = cell.text().strip() if cell is not None else ""
         old = getattr(self._obj, attr)
+        if isinstance(old, bool):
+            shown = "true" if old else "false"
+        elif isinstance(old, int) and attr in ("reset_value", "reset_mask", "base_address",
+                                               "address_offset"):
+            shown = f"{old:#x}"
+        else:
+            shown = str(old)
+        if text == shown:
+            return  # unchanged: never push a no-op undo step
         try:
             if isinstance(old, bool):
                 new = text.lower() in ("1", "true", "yes", "真", "是")
             elif isinstance(old, int):
                 new = int(text, 0)
-            elif isinstance(old, str):
-                new = text
             else:
                 new = text
         except (TypeError, ValueError):
-            new = text
+            cell.setText(shown)  # invalid input: restore instead of corrupting
+            return
         self.valueEdited.emit(self._obj, attr, new)

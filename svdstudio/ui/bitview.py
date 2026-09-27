@@ -1,6 +1,8 @@
 """Register bit layout: accurate canvas + readable, linkable field legend."""
 from __future__ import annotations
 
+import typing
+
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from svdstudio.domain.model import SvdField, SvdRegister
+from svdstudio.ui.i18n import t
 
 PALETTE = [
     QColor("#3f78a8"), QColor("#c2762b"), QColor("#4f9660"), QColor("#b64d53"),
@@ -193,21 +196,26 @@ class _BitCanvas(QWidget):
 
 class BitView(QWidget):
     fieldClicked = Signal(object)
+    fieldEdited = Signal(object, str, object)
     createRequested = Signal(int)
+
+    # legend columns the user may edit in place: name / access / description
+    EDITABLE_COLUMNS: typing.ClassVar[dict] = {0: "name", 3: "access", 5: "description"}
 
     def __init__(self):
         super().__init__()
         self.reg: SvdRegister | None = None
+        self._legend_loading = False
         self.canvas = _BitCanvas()
         self.canvas.createRequested.connect(self.createRequested.emit)
-        self.title = QLabel("Bit Layout")
+        self.title = QLabel(t("bit_layout_title"))
         self.legend = QTableWidget(0, 6)
-        self.legend.setHorizontalHeaderLabels(
-            ["Field", "Bits", "Width", "Access", "Reset", "Description"]
-        )
+        self.legend.setHorizontalHeaderLabels(self._headers())
         self.legend.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.legend.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.legend.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.legend.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.legend.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                    | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.legend.itemChanged.connect(self._on_legend_changed)
         self.legend.setAlternatingRowColors(True)
         self.legend.verticalHeader().setVisible(False)
         header = self.legend.horizontalHeader()
@@ -230,15 +238,32 @@ class BitView(QWidget):
         layout.addWidget(self.canvas)
         layout.addWidget(self.legend, 1)
 
+    @staticmethod
+    def _headers() -> list[str]:
+        return [t("f_field"), t("f_bits"), t("f_width"), t("f_access"), t("f_reset"),
+                t("f_description")]
+
+    def retranslate(self):
+        self.legend.setHorizontalHeaderLabels(self._headers())
+        self.set_register(self.reg)
+
     def set_register(self, register: SvdRegister | None):
+        changed = register is not self.reg
         self.reg = register
         self.canvas.set_register(register)
-        self.legend.setRowCount(0)
+        if changed and register is not None:
+            self._fade_canvas()
+        self._legend_loading = True
+        try:
+            self.legend.setRowCount(0)
+        finally:
+            self._legend_loading = False
         if register is None:
-            self.title.setText("Bit Layout")
+            self.title.setText(t("bit_layout_title"))
             return
         self.title.setText(
-            f"Bit Layout  ·  {register.name}  ·  {register.size}-bit  ·  {len(register.fields)} field(s)"
+            f"{t('bit_layout_title')}  ·  {register.name}  ·  {register.size}-bit  ·  "
+            f"{len(register.fields)} {t('f_field')}(s)"
         )
         for field in register.fields:
             row = self.legend.rowCount()
@@ -257,7 +282,46 @@ class BitView(QWidget):
                 (field.description or "") + enum_note,
             )
             for column, value in enumerate(values):
-                self.legend.setItem(row, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                if column in self.EDITABLE_COLUMNS:
+                    cell.setToolTip(t("legend_tip_edit"))
+                else:
+                    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                cell.setData(Qt.ItemDataRole.UserRole, field)
+                self.legend.setItem(row, column, cell)
+
+    def _on_legend_changed(self, item: QTableWidgetItem):
+        if self._legend_loading:
+            return
+        field = item.data(Qt.ItemDataRole.UserRole)
+        attr = self.EDITABLE_COLUMNS.get(item.column())
+        if field is None or attr is None or self.reg is None or field not in self.reg.fields:
+            return
+        text = item.text().strip()
+        if attr == "name":
+            if not text or any(f is not field and f.name == text for f in self.reg.fields):
+                self.set_register(self.reg)  # revert invalid rename
+                return
+            if text == field.name:
+                return
+        elif text == (getattr(field, attr) or ""):
+            return
+        self.fieldEdited.emit(field, attr, text)
+
+    def _fade_canvas(self):
+        """Subtle 180ms fade so register switches feel alive without distraction."""
+        from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        effect = self.canvas.graphicsEffect()
+        if not isinstance(effect, QGraphicsOpacityEffect):
+            effect = QGraphicsOpacityEffect(self.canvas)
+            self.canvas.setGraphicsEffect(effect)
+        self._fade_anim = QPropertyAnimation(effect, b"opacity", self)
+        self._fade_anim.setDuration(180)
+        self._fade_anim.setStartValue(0.35)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.start()
 
     def _canvas_clicked(self, field: SvdField):
         self._select_field(field)

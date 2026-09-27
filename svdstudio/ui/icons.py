@@ -36,19 +36,26 @@ _ICONS = {
     "import": "fa5s.file-import",
     "diff": "fa5s.not-equal",
     "bit": "fa5s.th",
+    "new": "fa5s.plus",
+    "copy": "fa5s.clone",
+    "paste": "fa5s.paste",
+    "move_up": "fa5s.arrow-up",
+    "move_down": "fa5s.arrow-down",
 }
 
 
 COLORS = {
-    "device": "#4a7ab0", "cpu": "#c26a5a", "peripherals": "#4a7ab0",
-    "peripheral": "#4a7ab0", "cluster": "#b98a3e", "register": "#3f9e6b",
-    "register_map": "#3f9e6b", "field": "#8b6fc0", "enum": "#c07f35",
-    "enum_value": "#8fa0b3", "open": "#4a7ab0", "save": "#3f9e6b",
-    "validate": "#3f9e6b", "add": "#3f9e6b", "duplicate": "#8b6fc0",
-    "delete": "#c0392b", "undo": "#5a7a99", "redo": "#5a7a99",
-    "search": "#5a7a99", "address": "#b98a3e", "warning": "#b7791f",
-    "error": "#c0392b", "info": "#2e6da4", "theme": "#8b6fc0",
-    "import": "#4a7ab0", "diff": "#b98a3e", "bit": "#8b6fc0",
+    "device": "#8496b3", "cpu": "#bf8b7d", "peripherals": "#8496b3",
+    "peripheral": "#7ba7d4", "cluster": "#c3ac7c", "register": "#82b894",
+    "register_map": "#82b894", "field": "#a895c7", "enum": "#c7a06a",
+    "enum_value": "#9fb3c8", "open": "#7ba7d4", "save": "#82b894",
+    "validate": "#82b894", "add": "#82b894", "duplicate": "#a895c7",
+    "delete": "#c08a8a", "undo": "#8b9bb0", "redo": "#8b9bb0",
+    "search": "#8b9bb0", "address": "#c3ac7c", "warning": "#c9a45c",
+    "error": "#c08a8a", "info": "#7ba7d4", "theme": "#a895c7",
+    "import": "#7ba7d4", "diff": "#c3ac7c", "bit": "#a895c7",
+    "new": "#82b894", "copy": "#8b9bb0", "paste": "#8b9bb0",
+    "move_up": "#8b9bb0", "move_down": "#8b9bb0",
 }
 
 
