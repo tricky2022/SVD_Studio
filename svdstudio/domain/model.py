@@ -23,12 +23,17 @@ class NodeMeta:
     # line in the source SVD where this element was parsed from; lets the
     # validator point at the exact spot in the vendor file
     line: int = 0
+    # attributes explicitly present in the source document. The writer emits
+    # an optional element only when it is in this set (source-preserving
+    # save); absent != explicit-default (see domain/model.py tri-state note).
+    present: set[str] = field(default_factory=set)
 
 @dataclass
 class EnumValue:
     name: str = ""
     description: str = ""
     value: int = 0
+    is_default: bool = False
     meta: NodeMeta = field(default_factory=NodeMeta)
 
 @dataclass
@@ -36,6 +41,7 @@ class EnumeratedValues:
     name: str = ""
     usage: str = ""  # read/write/read-write
     derived_from: str = ""
+    header_enum_name: str = ""
     values: list[EnumValue] = field(default_factory=list)
 
 @dataclass
@@ -56,36 +62,64 @@ class SvdField:
     reset_value: int | None = None
     read_action: str = ""
     modified_write_values: str = ""
-    write_constraint: str = ""
+    write_constraint: str = ""  # "" | "writeAsRead" | "useEnumeratedValues" | "range"
+    write_constraint_min: int | None = None
+    write_constraint_max: int | None = None
     enumerated_values: list[EnumeratedValues] = field(default_factory=list)
     derived_from: str = ""
     dim: DimInfo = field(default_factory=DimInfo)
+    # which bit-range form the author used; the canonical lsb/width store is
+    # derived from this so a present single-bit `msb=0` or a `bitRange [7:4]`
+    # survives without being silently rewritten (see roundtrip strategy).
+    source_range_form: str = ""  # "" | "bitOffset" | "lsb_msb" | "bitRange"
     meta: NodeMeta = field(default_factory=NodeMeta)
-    def __post_init__(self):
-        if self.msb == 0 and self.bit_width:
-            self.msb = self.bit_offset + self.bit_width - 1
-            self.lsb = self.bit_offset
 
 @dataclass
 class SvdRegister:
+    # `size`/`reset_value`/`reset_mask` are tri-state: None means the element
+    # was ABSENT in the source (or not yet authored). Readers that need the
+    # effective value use the `*_value` accessors (schema defaults); writers
+    # must not emit a value that was not present (principle: never write
+    # effective values back into the source model).
     name: str = ""
     display_name: str = ""
     description: str = ""
     address_offset: int = 0
-    size: int = 32
+    size: int | None = None
     access: str = ""
     protection: str = ""
-    reset_value: int = 0
-    reset_mask: int = 0xFFFFFFFF
+    reset_value: int | None = None
+    reset_mask: int | None = None
     read_action: str = ""
     modified_write_values: str = ""
-    write_constraint: str = ""
+    write_constraint: str = ""  # "" | "writeAsRead" | "useEnumeratedValues" | "range"
+    write_constraint_min: int | None = None
+    write_constraint_max: int | None = None
     alternate_register: str = ""
     derived_from: str = ""
     dim: DimInfo = field(default_factory=DimInfo)
     fields: list[SvdField] = field(default_factory=list)
     enumerated_values: list[EnumeratedValues] = field(default_factory=list)
     meta: NodeMeta = field(default_factory=NodeMeta)
+
+    # -- effective accessors (schema defaults, never persisted) -----------
+    SCHED_SIZE = 32
+    SCHED_RESET_VALUE = 0x0
+    SCHED_RESET_MASK_FULL = 0xFFFFFFFF
+
+    @property
+    def size_value(self) -> int:
+        return self.size if self.size is not None else self.SCHED_SIZE
+
+    @property
+    def reset_value_value(self) -> int:
+        return self.reset_value if self.reset_value is not None else self.SCHED_RESET_VALUE
+
+    @property
+    def reset_mask_value(self) -> int:
+        if self.reset_mask is not None:
+            return self.reset_mask
+        return (1 << self.size_value) - 1 if self.size_value < 64 else self.SCHED_RESET_MASK_FULL
 
 @dataclass
 class SvdCluster:
@@ -106,6 +140,14 @@ class AddressBlock:
     usage: str = "registers"
 
 @dataclass
+class SvdInterrupt:
+    name: str = ""
+    description: str = ""
+    value: int = 0
+    meta: NodeMeta = field(default_factory=NodeMeta)
+
+
+@dataclass
 class SvdPeripheral:
     name: str = ""
     display_name: str = ""
@@ -116,8 +158,10 @@ class SvdPeripheral:
     append_to_name: str = ""
     header_struct_name: str = ""
     derived_from: str = ""
+    disable_condition: str = ""
     dim: DimInfo = field(default_factory=DimInfo)
     address_blocks: list[AddressBlock] = field(default_factory=list)
+    interrupts: list[SvdInterrupt] = field(default_factory=list)
     registers: list[SvdRegister] = field(default_factory=list)
     clusters: list[SvdCluster] = field(default_factory=list)
     meta: NodeMeta = field(default_factory=NodeMeta)
@@ -131,6 +175,7 @@ class CpuInfo:
     fpu_present: bool = False
     nvic_prio_bits: int = 0
     vendor_systick_config: bool = False
+    meta: NodeMeta = field(default_factory=NodeMeta)
 
 @dataclass
 class SvdDevice:

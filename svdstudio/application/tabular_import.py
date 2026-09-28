@@ -226,7 +226,7 @@ def import_rows(
 
     result.peripherals_created = len(peripherals)
     for peripheral in result.device.peripherals:
-        max_end = max((r.address_offset + max(1, r.size // 8) for r in peripheral.registers), default=0)
+        max_end = max((r.address_offset + max(1, r.size_value // 8) for r in peripheral.registers), default=0)
         if max_end:
             peripheral.address_blocks.append(AddressBlock(offset=0, size=max_end))
     return result

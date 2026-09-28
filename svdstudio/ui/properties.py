@@ -97,6 +97,10 @@ class PropertyEditor(QTableWidget):
         self._obj = None
         self._loading = False
         self._row_attr: list[str | None] = []
+        # closed-set attributes edit through a dropdown editor created on
+        # demand (see ChoiceDelegate); no persistent cell widgets are kept.
+        from svdstudio.ui.delegates import ChoiceDelegate
+        self.setItemDelegateForColumn(1, ChoiceDelegate(CHOICES, self))
         self.cellChanged.connect(self._on_cell)
 
     def current_object(self):
@@ -111,8 +115,10 @@ class PropertyEditor(QTableWidget):
     def set_object(self, obj):
         self._loading = True
         self._obj = obj
-        for row in range(self.rowCount()):
-            self.removeCellWidget(row, 1)
+        # No persistent cell widgets are kept (dropdowns are delegate editors
+        # created on demand), so clearing rows frees everything. Do NOT go
+        # back to per-row QComboBox cell widgets: detached cell widgets are
+        # never deleted by Qt and leaked ~1MB per register switch.
         self.setRowCount(0)
         self._row_attr = []
         if obj is not None and is_dataclass(obj):
@@ -179,36 +185,16 @@ class PropertyEditor(QTableWidget):
             text = str(value)
         self.setItem(row, 0, name_item)
         choices = CHOICES.get(attr)
-        if choices is not None and not isinstance(value, bool):
-            from PySide6.QtWidgets import QComboBox
-            combo = QComboBox()
-            combo.addItems(choices)
-            combo.setCurrentText(text if text in choices else "")
-            combo.setToolTip(f"{attr}: SVD 标准取值")
-            combo.currentTextChanged.connect(
-                lambda new_text, a=attr: self._on_choice(a, new_text))
-            self.setCellWidget(row, 1, combo)
-            shadow = QTableWidgetItem(text)
-            shadow.setFlags(shadow.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.setItem(row, 1, shadow)
-        else:
-            value_item = QTableWidgetItem(text)
-            value_item.setToolTip(f"{attr}: {text}")
-            self.setItem(row, 1, value_item)
+        value_item = QTableWidgetItem(text)
+        value_item.setToolTip(f"{attr}: {text}" + (" (SVD 标准取值)" if choices else ""))
+        value_item.setData(Qt.ItemDataRole.UserRole, attr)
+        self.setItem(row, 1, value_item)
         self._row_attr.append(attr)
 
-    def _on_choice(self, attr: str, text: str):
-        if self._loading or self._obj is None:
-            return
-        if getattr(self._obj, attr, "") == text:
-            return
-        self.valueEdited.emit(self._obj, attr, text)
-
     def _on_cell(self, row, column):
+        # Single commit path for typed text and delegate dropdowns alike.
         if self._loading or column != 1 or self._obj is None:
             return
-        if self.cellWidget(row, 1) is not None:
-            return  # combo-driven rows commit via _on_choice
         if row >= len(self._row_attr) or self._row_attr[row] is None:
             return
         attr = self._row_attr[row]

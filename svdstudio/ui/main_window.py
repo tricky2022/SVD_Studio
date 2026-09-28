@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QIODevice, QSettings, QSortFilterProxyModel, Qt
-from PySide6.QtGui import QAction, QKeySequence, QUndoStack
+from PySide6.QtGui import QAction, QColor, QKeySequence, QUndoStack
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -150,6 +150,16 @@ class MainWindow(QMainWindow):
         if map_layout is not None and map_layout.layout() is not None:
             map_layout.layout().setContentsMargins(4, 1, 4, 1)
             map_layout.layout().setSpacing(1)
+            from svdstudio.ui.memory_map import MemoryMapView
+            self._memory_map = MemoryMapView(self)
+            self._memory_map.registerClicked.connect(self._memory_map_select)
+            # insert above the register map (index 0 = map view; keep title on top)
+            layout = map_layout.layout()
+            # constant strip height: the map area never reflows on selection.
+            self._memory_map.setFixedHeight(84)
+            layout.insertWidget(layout.count() - 1, self._memory_map)
+        else:
+            self._memory_map = None
         self.props.valueEdited.connect(self._edit)
         self.bitview.fieldClicked.connect(self._show_object)
         self.bitview.fieldEdited.connect(self._edit_field_from_legend)
@@ -179,7 +189,8 @@ class MainWindow(QMainWindow):
             self.device_tree.EditTrigger.DoubleClicked
             | self.device_tree.EditTrigger.EditKeyPressed)
         self.device_tree.setAnimated(True)
-        self.device_tree.setIndentation(16)
+        self.device_tree.setIndentation(18)
+        self.device_tree.setRootIsDecorated(True)
         self.device_tree.setSelectionMode(self.device_tree.SelectionMode.ExtendedSelection)
         self.device_tree.installEventFilter(self)
         map_view = self.findChild(QWidget, "registerMapView")
@@ -192,12 +203,24 @@ class MainWindow(QMainWindow):
         self.main_splitter.setStretchFactor(1, 4)
         self.main_splitter.setStretchFactor(2, 2)
         self.main_splitter.setSizes([300, 860, 380])
+        # fixed editor proportions: register map / bit layout / diagnostics.
+        # Without explicit stretches the VBox hands all free space to the
+        # widget with the largest sizeHint, which is why the panels felt
+        # "off" and shifted whenever content changed.
+        editor = self.findChild(QWidget, "editorPanel")
+        if editor is not None and editor.layout() is not None:
+            layout = editor.layout()
+            layout.setStretch(1, 4)  # registerMapPlaceholder
+            layout.setStretch(2, 4)  # bitViewPlaceholder
+            layout.setStretch(3, 2)  # lowerTabs (capped at 220px max)
         # VS-style tree: context menu + keyboard instead of button bar
         self.device_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.device_tree.customContextMenuRequested.connect(self._tree_menu)
         self.device_tree.doubleClicked.connect(self._rename_at)
         self.device_tree.expanded.connect(self._on_tree_expanded)
         self.device_tree.collapsed.connect(self._on_tree_collapsed)
+        self._setup_command_palette()
+        self._setup_recent_menu()
         self._apply_texts()
         self._retranslate_panels()
 
@@ -602,6 +625,8 @@ class MainWindow(QMainWindow):
         if view is not None and hasattr(view, "setModel"):
             from PySide6.QtGui import QStandardItemModel
             view.setModel(QStandardItemModel(0, 0))
+        if getattr(self, "_memory_map", None) is not None:
+            self._memory_map.clear()
         self.problems.clear()
 
     def set_theme(self, mode: str):
@@ -639,6 +664,7 @@ class MainWindow(QMainWindow):
         self._show_issues(issues)
         self.workspace_state.setText(Path(path).stem.upper())
         self.output.appendPlainText(f"Loaded: {path}")
+        self._remember_recent(path)
         self.statusBar().showMessage(
             f"Loaded {len(self.state.device.peripherals)} peripheral(s)", 5000)
 
@@ -656,6 +682,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已保存 {self.state.path}")
         self.output.appendPlainText(f"Saved: {self.state.path}")
         self.workspace_state.setText(Path(self.state.path).stem.upper())
+        self._remember_recent(self.state.path)
 
     def save_as(self):
         if not self.state.device:
@@ -673,6 +700,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已保存 {self.state.path}")
         self.output.appendPlainText(f"Saved: {self.state.path}")
         self.workspace_state.setText(Path(self.state.path).stem.upper())
+        self._remember_recent(self.state.path)
 
     def revalidate(self):
         if not self.state.device:
@@ -721,7 +749,7 @@ class MainWindow(QMainWindow):
         if reg is None:
             return
         from svdstudio.ui.create_dialogs import FieldDialog
-        dialog = FieldDialog(reg.size, self)
+        dialog = FieldDialog(reg.size_value, self)
         dialog.lsb.setText(str(bit))
         dialog.width.setText("1")
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -771,24 +799,36 @@ class MainWindow(QMainWindow):
         if source is not None and source.isValid():
             proxy_idx = self.proxy.mapFromSource(source)
             self.device_tree.setCurrentIndex(proxy_idx)
-            self.device_tree.scrollTo(proxy_idx, self.device_tree.ScrollHint.PositionAtCenter)
+            self.device_tree.scrollTo(proxy_idx, self.device_tree.ScrollHint.EnsureVisible)
             self._select(proxy_idx)
             return True
         return False
 
     def _show_issues(self, issues):
-        from PySide6.QtGui import QColor
         from PySide6.QtWidgets import QListWidgetItem
+
+        from svdstudio.ui.palette import semantic_color
+
+        def _color(sev):
+            if sev == "ERROR":
+                return QColor(semantic_color("error"))
+            if sev == "WARNING":
+                return QColor(semantic_color("warning"))
+            if sev == "INFO":
+                return QColor(semantic_color("info"))
+            if sev == "HINT":
+                return QColor(semantic_color("info"))
+            return QColor(semantic_color("info"))
+
         self.problems.clear()
         self._issue_objects = list(issues)
-        colors = {"ERROR": QColor("#c0392b"), "WARNING": QColor("#b7791f"), "INFO": QColor("#2e6da4")}
         for issue in issues:
             sev = issue.severity.value.upper()
             marker = {"ERROR": "●", "WARNING": "●"}.get(sev, "○")
             location = issue.location() if hasattr(issue, "location") else issue.path
             rule = f"{issue.rule_id}  " if issue.rule_id else ""
             item = QListWidgetItem(f"{marker} {rule}{location}\n     {issue.message}")
-            color = colors.get(sev)
+            color = _color(sev)
             if color is not None:
                 item.setForeground(color)
             hint = getattr(issue, "suggestion", "")
@@ -890,7 +930,9 @@ class MainWindow(QMainWindow):
                 self.device_tree.expand(parent)
             parent = parent.parent()
         self._show_object(node.obj)
-        self.bitview.set_register(node.obj if isinstance(node.obj, SvdRegister) else None)
+        reg_obj = node.obj if isinstance(node.obj, SvdRegister) else None
+        address, periph = self._register_context(reg_obj) if reg_obj else (None, "")
+        self.bitview.set_register(reg_obj, address=address, peripheral=periph)
         self._update_register_map(node.obj)
         self._update_status(node)
         self._sync_breadcrumb()
@@ -905,7 +947,7 @@ class MainWindow(QMainWindow):
             cursor = cursor.parent
         path = ".".join(reversed([p for p in parts if p]))
         if isinstance(obj, SvdRegister) and self.state.device is not None:
-            self.statusBar().showMessage(f"{path}  size={obj.size}  reset={obj.reset_value:#x}")
+            self.statusBar().showMessage(f"{path}  size={obj.size_value}  reset={obj.reset_value_value:#x}")
         elif isinstance(obj, SvdField):
             label = str(obj.lsb) if obj.bit_width == 1 else f"{obj.msb}:{obj.lsb}"
             self.statusBar().showMessage(f"{path}  bits {label}")
@@ -958,16 +1000,18 @@ class MainWindow(QMainWindow):
                 if row >= 0:
                     was_loading, self._map_loading = self._map_loading, True
                     try:
-                        view.selectRow(row)
-                        view.scrollTo(view.model().index(row, 0))
+                        self._select_map_row(view, row)
                     finally:
                         self._map_loading = was_loading
             return
         self._map_signature_cache = signature
 
-        from PySide6.QtWidgets import QHeaderView as _HV
         self._map_loading = True
         view.setUpdatesEnabled(False)
+        # keep the user's viewport + column widths across rebuilds
+        prev_widths = [view.columnWidth(c) for c in range(view.model().columnCount())] \
+            if view.model() is not None else []
+        prev_scroll = view.verticalScrollBar().value()
         try:
             model = QStandardItemModel(0, 5)
             model.setHorizontalHeaderLabels([t("offset"), t("name"), t("access"), t("reset"), t("description")])
@@ -977,7 +1021,7 @@ class MainWindow(QMainWindow):
                     QStandardItem(f"{reg.address_offset:#06x}  ({abs_addr:#010x})"),
                     QStandardItem(reg.name),
                     QStandardItem(reg.access or "—"),
-                    QStandardItem(f"{reg.reset_value:#010x}"),
+                    QStandardItem(f"{reg.reset_value_value:#010x}"),
                     QStandardItem(reg.description or ""),
                 ]
                 for cell in cells:
@@ -990,28 +1034,12 @@ class MainWindow(QMainWindow):
                 model.appendRow(cells)
             view.setModel(model)
             model.itemChanged.connect(self._on_map_item_changed)
-            view.setAlternatingRowColors(True)
-            view.setSelectionBehavior(view.SelectionBehavior.SelectRows)
-            view.setSelectionMode(view.SelectionMode.ExtendedSelection)
-            view.setEditTriggers(view.EditTrigger.DoubleClicked
-                                 | view.EditTrigger.EditKeyPressed
-                                 | view.EditTrigger.AnyKeyPressed)
-            from svdstudio.ui.delegates import AccessDelegate
-            if not getattr(view, "_svd_access_delegate", False):
-                view.setItemDelegateForColumn(2, AccessDelegate(view))
-                view._svd_access_delegate = True
-            header = view.horizontalHeader()
-            header.setStretchLastSection(True)
-            header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(1, _HV.ResizeMode.Interactive)
-            header.setSectionResizeMode(2, _HV.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(3, _HV.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(4, _HV.ResizeMode.Stretch)
-            header.setMinimumSectionSize(70)
-            view.setColumnWidth(0, 190)
-            view.setColumnWidth(1, 210)
-            view.setColumnWidth(2, 120)
-            view.setColumnWidth(3, 140)
+            self._configure_map_view_once(view)
+            # restore the user's column widths; first build keeps content fit
+            for c, w in enumerate(prev_widths):
+                if c < model.columnCount() and w > 0:
+                    view.setColumnWidth(c, w)
+            view.verticalScrollBar().setValue(prev_scroll)
             view.verticalHeader().setVisible(False)
             # bidirectional link: click a map row -> select register in tree.
             # Connected exactly once per view (guard flag: blind disconnect()
@@ -1026,11 +1054,54 @@ class MainWindow(QMainWindow):
             if isinstance(obj, SvdRegister):
                 row = self._map_row_for(view, obj)
                 if row >= 0:
-                    view.selectRow(row)
-                    view.scrollTo(model.index(row, 0))
+                    self._select_map_row(view, row)
         finally:
             self._map_loading = False
             view.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _configure_map_view_once(view):
+        """Header/selection/edit policy: applied exactly once per view.
+
+        Re-applying section resize modes + fixed pixel widths on every rebuild
+        is what made the columns breathe. Content fit happens once; after that
+        the user's widths are preserved by the caller.
+        """
+        from PySide6.QtWidgets import QHeaderView as _HV
+        if getattr(view, "_svd_configured", False):
+            return
+        view.setAlternatingRowColors(True)
+        view.setSelectionBehavior(view.SelectionBehavior.SelectRows)
+        view.setSelectionMode(view.SelectionMode.ExtendedSelection)
+        view.setEditTriggers(view.EditTrigger.DoubleClicked
+                             | view.EditTrigger.EditKeyPressed
+                             | view.EditTrigger.AnyKeyPressed)
+        from svdstudio.ui.delegates import AccessDelegate
+        view.setItemDelegateForColumn(2, AccessDelegate(view))
+        header = view.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, _HV.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, _HV.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, _HV.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, _HV.ResizeMode.Stretch)
+        header.setMinimumSectionSize(70)
+        view._svd_configured = True
+
+    @staticmethod
+    def _select_map_row(view, row: int):
+        """Highlight a map row without yanking the viewport.
+
+        The old code called scrollTo(PositionAtCenter-equivalent) on every
+        highlight, so clicking the legend visibly shoved the map. Now we only
+        scroll when the row is actually outside the visible area.
+        """
+        view.selectRow(row)
+        top = view.rowViewportPosition(row)
+        bottom = top + view.rowHeight(row)
+        if top < 0 or bottom > view.viewport().height():
+            view.scrollTo(view.model().index(row, 0),
+                          view.ScrollHint.EnsureVisible)
 
     def _on_map_clicked(self, index):
         view = self.findChild(QWidget, "registerMapView")
@@ -1079,7 +1150,7 @@ class MainWindow(QMainWindow):
                     self._refresh()  # normalize the "—" display, no undo step
             elif col == 3:
                 new = int(text, 0)
-                if new != reg.reset_value:
+                if new != reg.reset_value_value:
                     self.undo.push(C.SetAttrCommand(reg, "reset_value", new, self._refresh))
                     self.state.dirty = True
             elif col == 4:
@@ -1224,7 +1295,9 @@ class MainWindow(QMainWindow):
         if source is not None and source.isValid():
             proxy_idx = self.proxy.mapFromSource(source)
             self.device_tree.setCurrentIndex(proxy_idx)
-            self.device_tree.scrollTo(proxy_idx, self.device_tree.ScrollHint.PositionAtCenter)
+            # EnsureVisible, not PositionAtCenter: centering yanked the whole
+            # tree (and, perceptually, the panels next to it) on every click.
+            self.device_tree.scrollTo(proxy_idx, self.device_tree.ScrollHint.EnsureVisible)
             self._select(proxy_idx)
 
     def run_import_wizard(self):
@@ -1438,6 +1511,36 @@ class MainWindow(QMainWindow):
     def _show_object(self, obj):
         """Single funnel for the property panel so every selection path stays in sync."""
         self.props.set_object(obj)
+        self._sync_memory_map(obj)
+
+    def _sync_memory_map(self, obj):
+        """Update the memory map in place; geometry never changes on select.
+
+        The strip keeps a constant height so the register map above it never
+        reflows when moving between tree nodes (that resize churn is what
+        made the map "run around"). Only the painted content changes.
+        """
+        if self._memory_map is None:
+            return
+        periph = None
+        if isinstance(obj, SvdPeripheral):
+            periph = obj
+        elif isinstance(obj, SvdRegister):
+            node = self.model.node_for(obj)
+            cursor = node.parent if node else None
+            while cursor is not None:
+                if isinstance(cursor.obj, SvdPeripheral):
+                    periph = cursor.obj
+                    break
+                cursor = cursor.parent
+        if periph is not None:
+            self._memory_map.set_device(self.state.device, periph)
+        else:
+            self._memory_map.clear()
+
+    def _memory_map_select(self, reg):
+        if reg is not None:
+            self._select_object(reg)
 
     def _edit(self, obj, attr, new):
         old = getattr(obj, attr, "")
@@ -1455,7 +1558,7 @@ class MainWindow(QMainWindow):
         reg = self.bitview.reg
         if reg is None or field not in reg.fields:
             return
-        size = reg.size or 32
+        size = reg.size_value
         if lsb < 0 or width < 1 or lsb + width > size:
             self.statusBar().showMessage(t("field_err_range").format(size=size), 4000)
             self.bitview.set_register(reg)
@@ -1531,7 +1634,7 @@ class MainWindow(QMainWindow):
         reg = self.bitview.reg
         if reg is None:
             return
-        size = reg.size or 32
+        size = reg.size_value
         dialog = QDialog(self)
         dialog.setWindowTitle(t("field_batch_title"))
         layout = QFormLayout(dialog)
@@ -1589,6 +1692,105 @@ class MainWindow(QMainWindow):
         self.state.dirty = True
         self.statusBar().showMessage(t("field_batch_done").format(count=len(plan)), 4000)
 
+    def _setup_command_palette(self):
+        """Ctrl+K: invoke any editor command from a filterable list."""
+        from PySide6.QtGui import QAction, QKeySequence
+
+        from svdstudio.ui.command_palette import CommandPalette
+
+        def show_palette():
+            commands = [
+                ("打开文件…", self.open, "Ctrl+O"),
+                ("保存", self.save, "Ctrl+S"),
+                ("另存为…", self.save_as, "Ctrl+Shift+S"),
+                ("校验 (F5)", self.revalidate, "F5"),
+                ("表格导入…", self.run_import_wizard, ""),
+                ("设备对比…", self.run_diff, ""),
+                ("Overlay 覆盖…", self.run_overlay, ""),
+                ("批量编辑…", self.run_batch, ""),
+                ("用官方 Schema 校验…", self.validate_with_schema, ""),
+                ("复制校验诊断报告", self.copy_diagnostics, ""),
+                ("新建设备…", self.new_device, "Ctrl+N"),
+                ("新建子项", self.add_selected_child, ""),
+                ("复制选中", self.duplicate_selected, "Ctrl+D"),
+                ("删除选中", self.delete_selected, "Del"),
+                ("编辑枚举…", self.edit_enums, ""),
+                ("撤销", self.undo.undo, "Ctrl+Z"),
+                ("重做", self.undo.redo, "Ctrl+Y"),
+                ("搜索…", lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+F"),
+                ("切换主题", self.toggle_theme, ""),
+                ("AI 与自动化接口…", self.show_ai_help, ""),
+                ("关于", self.show_about, ""),
+            ]
+            CommandPalette(commands, self).exec()
+
+        palette_action = QAction("命令面板 (Command Palette)", self)
+        palette_action.setShortcut(QKeySequence("Ctrl+K"))
+        palette_action.triggered.connect(show_palette)
+        self.addAction(palette_action)
+
+    def _setup_recent_menu(self):
+        """File > Recent SVD: remembers recently opened/saved files in QSettings."""
+        for existing in self.findChildren(QAction):
+            if existing.text() == t("recents"):
+                self._recent_menu = existing.menu() if hasattr(existing, "menu") else None
+                return
+        recent_menu = self.menuBar().addMenu(t("recents"))
+        self._recent_menu = recent_menu
+        self._recent_menu.aboutToShow.connect(self._populate_recent)
+        self._populate_recent()
+
+    def _recents(self) -> list[str]:
+        settings = QSettings("SVD Studio", "SVD Studio")
+        raw = settings.value("recents", [])
+        if not isinstance(raw, list):
+            raw = []
+        return [p for p in raw if p and Path(p).exists()][:10]
+
+    def _remember_recent(self, path: str):
+        if not path:
+            return
+        settings = QSettings("SVD Studio", "SVD Studio")
+        recents = self._recents()
+        if path in recents:
+            recents.remove(path)
+        recents.insert(0, path)
+        settings.setValue("recents", recents[:10])
+
+    def _populate_recent(self):
+        if getattr(self, "_recent_menu", None) is None:
+            return
+        self._recent_menu.clear()
+        recents = self._recents()
+        if not recents:
+            empty = self._recent_menu.addAction("无最近文件")
+            empty.setEnabled(False)
+            return
+        for path in recents:
+            self._recent_menu.addAction(path, lambda p=path: self.open_recent(p))
+
+    def open_recent(self, path: str):
+        if not Path(path).exists():
+            self._populate_recent()
+            return
+        self.open(path)
+
+    def _register_context(self, obj) -> tuple[int | None, str]:
+        from svdstudio.domain.model import SvdRegister
+        if not isinstance(obj, SvdRegister):
+            return None, ""
+        node = self.model.node_for(obj)
+        periph = None
+        cursor = node.parent if node else None
+        while cursor is not None:
+            if isinstance(cursor.obj, SvdPeripheral):
+                periph = cursor.obj
+                break
+            cursor = cursor.parent
+        if periph is None:
+            return None, ""
+        return periph.base_address + obj.address_offset, periph.name
+
     def _refresh(self):
         if not self.state.device or getattr(self, "_refreshing", False):
             # coalesce: a rebuild triggered from inside a rebuild must not
@@ -1623,8 +1825,9 @@ class MainWindow(QMainWindow):
                 self.device_tree.setCurrentIndex(proxy_idx)
             self._show_object(self._selected_node.obj)
             from svdstudio.domain.model import SvdRegister as _SR
-            self.bitview.set_register(
-                self._selected_node.obj if isinstance(self._selected_node.obj, _SR) else None)
+            reg_obj = self._selected_node.obj if isinstance(self._selected_node.obj, _SR) else None
+            address, periph = self._register_context(reg_obj) if reg_obj else (None, "")
+            self.bitview.set_register(reg_obj, address=address, peripheral=periph)
             self._update_register_map(self._selected_node.obj)
             self._update_status(self._selected_node)
 
@@ -1711,7 +1914,7 @@ class MainWindow(QMainWindow):
                 self.undo.push(C.append_command(obj.registers, item,
                                                 f"新建寄存器 {name}", self._refresh))
             elif isinstance(obj, SvdRegister):
-                dialog = FieldDialog(obj.size, self)
+                dialog = FieldDialog(obj.size_value, self)
                 if dialog.exec() != dialog.DialogCode.Accepted:
                     return
                 name, lsb, width, access, desc = dialog.parsed()

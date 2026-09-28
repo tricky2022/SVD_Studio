@@ -62,7 +62,7 @@ def address_lookup(device: SvdDevice, address: int, limit: int = 20) -> list[Sea
     for p in device.peripherals:
         for r in list(p.registers) + [reg for c in p.clusters for reg in c.registers]:
             abs_addr = p.base_address + r.address_offset
-            size_bytes = max(1, r.size // 8)
+            size_bytes = max(1, r.size_value // 8)
             if abs_addr <= address < abs_addr + size_bytes:
                 offset = address - abs_addr
                 hits.append(SearchHit("register", f"{p.name}.{r.name}",

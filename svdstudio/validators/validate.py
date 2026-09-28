@@ -105,9 +105,9 @@ def semantic_check(dev: SvdDevice) -> list[Issue]:
                     f"Offset {r.address_offset:#x} collides with {seen_off[r.address_offset]}",
                     r, suggestion="Registers in a peripheral must have unique offsets.")
             seen_off[r.address_offset] = r.name
-            if r.size not in (8, 16, 32, 64):
+            if r.size_value not in (8, 16, 32, 64):
                 add("SVD-REG-002", Severity.WARNING, rp,
-                    f"Unusual register size {r.size}; CMSIS expects 8/16/32/64", r)
+                    f"Unusual register size {r.size_value}; CMSIS expects 8/16/32/64", r)
             if r.derived_from and not (p.derived_from or ""):
                 add("SVD-DER-002", Severity.WARNING, rp,
                     f"derivedFrom {r.derived_from!r} used but the base peripheral "
@@ -120,9 +120,9 @@ def semantic_check(dev: SvdDevice) -> list[Issue]:
                 if f.bit_width < 1:
                     add("SVD-FIELD-004", Severity.ERROR, fp,
                         f"Field width is {f.bit_width}; bitWidth must be >= 1", f)
-                if f.bit_offset + f.bit_width > r.size:
+                if f.bit_offset + f.bit_width > r.size_value:
                     add("SVD-FIELD-001", Severity.ERROR, fp,
-                        f"Field [{f.msb}:{f.lsb}] exceeds the {r.size}-bit register", f,
+                        f"Field [{f.msb}:{f.lsb}] exceeds the {r.size_value}-bit register", f,
                         suggestion="Widen the register or shrink the field.")
                 for (start, width, other) in used:
                     if not (f.bit_offset + f.bit_width <= start or start + width <= f.bit_offset):

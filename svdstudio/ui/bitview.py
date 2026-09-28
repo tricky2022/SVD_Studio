@@ -72,13 +72,13 @@ class _BitCanvas(QWidget):
         self.update()
 
     def _bit_at(self, x: float) -> int | None:
-        if self.reg is None or self.reg.size <= 0:
+        if self.reg is None or self.reg.size_value <= 0:
             return None
-        cell = self.width() / self.reg.size
+        cell = self.width() / self.reg.size_value
         if cell <= 0:
             return None
-        bit = self.reg.size - 1 - int(x // cell)
-        return bit if 0 <= bit < self.reg.size else None
+        bit = self.reg.size_value - 1 - int(x // cell)
+        return bit if 0 <= bit < self.reg.size_value else None
 
     def mouseMoveEvent(self, event: QMouseEvent):
         bit = self._bit_at(event.position().x())
@@ -129,7 +129,7 @@ class _BitCanvas(QWidget):
                              "Select a register to inspect its bit layout")
             return
 
-        size = self.reg.size
+        size = self.reg.size_value
         cell = self.width() / size
         self._rects = []
 
@@ -138,7 +138,7 @@ class _BitCanvas(QWidget):
         painter.setFont(header_font)
         painter.setPen(self.palette().text().color())
         painter.drawText(6, 0, self.width() - 12, 18, Qt.AlignmentFlag.AlignLeft,
-                         f"{self.reg.name}   ·   {size}-bit   ·   reset {self.reg.reset_value:#0{2 + size // 4}x}")
+                         f"{self.reg.name}   ·   {size}-bit   ·   reset {self.reg.reset_value_value:#0{2 + size // 4}x}")
         painter.setFont(self.font())
 
         # bit ruler: hide numbers that cannot fit to avoid unreadable clutter
@@ -156,7 +156,7 @@ class _BitCanvas(QWidget):
         painter.setFont(self.font())
 
         used = [False] * size
-        reset = self.reg.reset_value
+        reset = self.reg.reset_value_value
 
         for index, field in enumerate(self.reg.fields):
             start = max(0, field.bit_offset)
@@ -278,12 +278,39 @@ class BitView(QWidget):
         self.legend.setHorizontalHeaderLabels(self._headers())
         self.set_register(self.reg)
 
-    def set_register(self, register: SvdRegister | None):
+    def _header_text(self) -> str:
+        """Register Header: name, effective size, absolute+offset address, reset."""
+        reg = self.reg
+        if reg is None:
+            return t("bit_layout_title")
+        addr = getattr(self, "_reg_address", None)
+        addr_tail = ""
+        if addr is not None:
+            addr_tail = f"  ·  {addr:#010x}"
+        reset = reg.reset_value
+        reset_txt = ""
+        if reset is not None:
+            reset_txt = f"  ·  reset {reset:#0{2 + max(2, reg.size_value // 4)}x}"
+        periph = getattr(self, "_reg_periph", "")
+        periph_txt = f"{periph}." if periph else ""
+        prov = getattr(reg.meta, "provenance", None)
+        prov_txt = f"  ·  {prov.value}" if prov is not None and prov.value not in ("original",) else ""
+        return (f"{periph_txt}{reg.name}   ·   {reg.size_value}-bit{addr_tail}"
+                f" ·  {len(reg.fields)} field(s){reset_txt}{prov_txt}")
+
+    def set_register(self, register: SvdRegister | None, address: int | None = None,
+                     peripheral: str = "", ):
         changed = register is not self.reg
         self.reg = register
+        self._reg_address = address if address is not None else getattr(self, "_reg_address", None)
+        self._reg_periph = peripheral if peripheral else getattr(self, "_reg_periph", "")
         self.canvas.set_register(register)
-        if changed and register is not None:
-            self._fade_canvas()
+        self.title.setText(self._header_text())
+        if changed:
+            # repaint synchronously: no fade animation. The previous opacity
+            # effect left the canvas mid-fade on rapid switches, which is why
+            # the bit view intermittently rendered blank.
+            self.canvas.update()
         # the loading guard must cover the whole rebuild: inserting cells emits
         # itemChanged, and an unguarded emit would push undo commands (and a
         # full view rebuild) for every cell just written
@@ -300,10 +327,7 @@ class BitView(QWidget):
         if register is None:
             self.title.setText(t("bit_layout_title"))
             return
-        self.title.setText(
-            f"{t('bit_layout_title')}  ·  {register.name}  ·  {register.size}-bit  ·  "
-            f"{len(register.fields)} {t('f_field')}(s)"
-        )
+        self.title.setText(self._header_text())
         # LSB-first: bit 0 at the top, matching how engineers read the map
         for field in sorted(register.fields, key=lambda f: (f.bit_offset, f.bit_width)):
             row = self.legend.rowCount()
@@ -394,19 +418,14 @@ class BitView(QWidget):
         self.fieldEdited.emit(field, attr, text)
 
     def _fade_canvas(self):
-        """Subtle 180ms fade so register switches feel alive without distraction."""
-        from PySide6.QtCore import QEasingCurve, QPropertyAnimation
-        from PySide6.QtWidgets import QGraphicsOpacityEffect
-        effect = self.canvas.graphicsEffect()
-        if not isinstance(effect, QGraphicsOpacityEffect):
-            effect = QGraphicsOpacityEffect(self.canvas)
-            self.canvas.setGraphicsEffect(effect)
-        self._fade_anim = QPropertyAnimation(effect, b"opacity", self)
-        self._fade_anim.setDuration(180)
-        self._fade_anim.setStartValue(0.35)
-        self._fade_anim.setEndValue(1.0)
-        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._fade_anim.start()
+        """Kept for API compatibility; intentionally a no-op.
+
+        The previous opacity animation left the canvas mid-fade on rapid
+        register switches, so the bit view intermittently rendered blank.
+        Repaint is synchronous now (see set_register).
+        """
+        self.canvas.setGraphicsEffect(None)
+        self.canvas.update()
 
     def _on_legend_menu(self, pos):
         self.legendMenuRequested.emit(self.legend.mapToGlobal(pos))
