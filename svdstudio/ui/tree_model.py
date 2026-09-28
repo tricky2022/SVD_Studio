@@ -26,6 +26,8 @@ FLAT_TONES = {
 
 
 class _Node:
+    __slots__ = ("children", "label", "obj", "parent")
+
     def __init__(self, label, obj=None, parent=None):
         self.label = label
         self.obj = obj
@@ -33,7 +35,13 @@ class _Node:
         self.children: list[_Node] = []
 
     def row(self):
+        # computed, not cached: CRUD mutates sibling lists behind the model's
+        # back and a cached row would go stale until the next full rebuild
         return self.parent.children.index(self) if self.parent else 0
+
+    def add(self, child):
+        self.children.append(child)
+        return child
 
 
 class DeviceTreeModel(QAbstractItemModel):
@@ -52,17 +60,45 @@ class DeviceTreeModel(QAbstractItemModel):
         self.beginResetModel()
         self.root = _Node("root")
         self._dev = dev
+        self._by_object: dict[int, _Node] = {}
         device_node = _Node(dev.name or "Device", dev, self.root)
         self.root.children.append(device_node)
         device_node.children.append(_Node("CPU", dev.cpu, device_node))
         peripherals_node = _Node("Peripherals", None, device_node)
         device_node.children.append(peripherals_node)
+        self._register(device_node)
         for peripheral in dev.peripherals:
             self._add_peripheral(peripheral, peripherals_node)
         self.endResetModel()
 
+    def _register(self, node: _Node) -> _Node:
+        if node.obj is not None:
+            self._by_object[id(node.obj)] = node
+        return node
+
+    def node_for(self, obj) -> _Node | None:
+        """O(1) node lookup by domain object (id-keyed, rebuilt per device)."""
+        if obj is None:
+            return None
+        return self._by_object.get(id(obj))
+
+    def source_index_for(self, obj) -> QModelIndex:
+        """QModelIndex of a domain object without walking the whole tree."""
+        node = self.node_for(obj)
+        if node is None or node.parent is None:
+            return QModelIndex()
+        chain, cursor = [], node
+        while cursor.parent is not None and cursor.parent is not self.root:
+            chain.append(cursor)
+            cursor = cursor.parent
+        chain.append(cursor)
+        index = QModelIndex()
+        for step in reversed(chain):
+            index = self.index(step.row(), 0, index)
+        return index
+
     def _add_peripheral(self, peripheral: SvdPeripheral, parent: _Node):
-        peripheral_node = _Node(peripheral.name, peripheral, parent)
+        peripheral_node = self._register(_Node(peripheral.name, peripheral, parent))
         parent.children.append(peripheral_node)
         for register in peripheral.registers:
             self._add_register(register, peripheral_node)
@@ -70,7 +106,7 @@ class DeviceTreeModel(QAbstractItemModel):
             self._add_cluster(cluster, peripheral_node)
 
     def _add_cluster(self, cluster: SvdCluster, parent: _Node):
-        cluster_node = _Node(cluster.name, cluster, parent)
+        cluster_node = self._register(_Node(cluster.name, cluster, parent))
         parent.children.append(cluster_node)
         for register in cluster.registers:
             self._add_register(register, cluster_node)
@@ -78,10 +114,10 @@ class DeviceTreeModel(QAbstractItemModel):
             self._add_cluster(nested, cluster_node)
 
     def _add_register(self, register: SvdRegister, parent: _Node):
-        register_node = _Node(register.name, register, parent)
+        register_node = self._register(_Node(register.name, register, parent))
         parent.children.append(register_node)
         for field in register.fields:
-            field_node = _Node(field.name, field, register_node)
+            field_node = self._register(_Node(field.name, field, register_node))
             register_node.children.append(field_node)
             for enum_values in field.enumerated_values:
                 self._add_enumerations(enum_values, field_node)
@@ -89,10 +125,13 @@ class DeviceTreeModel(QAbstractItemModel):
             self._add_enumerations(enum_values, register_node)
 
     def _add_enumerations(self, enum_values: EnumeratedValues, parent: _Node):
-        enum_node = _Node(enum_values.name or "Enumerated Values", enum_values, parent)
+        enum_node = self._register(
+            _Node(enum_values.name or "Enumerated Values", enum_values, parent))
         parent.children.append(enum_node)
         for value in enum_values.values:
-            enum_node.children.append(_Node(f"{value.name} = {value.value}", value, enum_node))
+            value_node = self._register(
+                _Node(f"{value.name} = {value.value}", value, enum_node))
+            enum_node.children.append(value_node)
 
     def index(self, row, column, parent=None):
         parent = parent if parent is not None else QModelIndex()

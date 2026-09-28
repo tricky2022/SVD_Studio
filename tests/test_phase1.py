@@ -34,7 +34,10 @@ def test_derived_chain():
 
 def test_domain_has_no_qt():
     import svdstudio.domain.model as m
-    assert not any("PySide" in str(v) for v in vars(m).values())
+    # __builtins__ is skipped: PySide6 registers itself there once imported,
+    # which made this assertion order-dependent rather than architectural
+    assert not any("PySide" in str(v) for k, v in vars(m).items()
+                   if not k.startswith("__"))
 
 
 def test_roundtrip_preserves_device_and_register_semantics(tmp_path):

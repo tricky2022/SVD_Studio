@@ -104,6 +104,17 @@ class ImportWizardDialog(QDialog):
         self.summary.setText(f"{len(header)} columns, showing {len(rows)} rows. Headers show auto-mapping.")
 
     def import_result(self, parent=None):
-        path = self.path_label.text()
+        """Kept for tests/CLI use: read widget state and import synchronously."""
+        request = self.import_request()
+        if request is None:
+            raise ValueError("no input file selected")
+        return TI.import_file(*request)
+
+    def import_request(self) -> tuple | None:
+        """Pure snapshot of the import inputs, safe to run off the GUI thread."""
+        path = self.path_label.text().strip()
+        if not path:
+            return None
         device = self.device_edit.currentText().strip() or "IMPORTED"
-        return TI.import_file(path, device, sheet=self.sheet.currentText() or None)
+        sheet = self.sheet.currentText() or ""
+        return (path, device, "", sheet)

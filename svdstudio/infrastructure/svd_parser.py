@@ -1,6 +1,8 @@
 """SVD XML -> domain parser (infrastructure, lxml allowed here)."""
 from __future__ import annotations
 
+import re
+
 from lxml import etree
 
 from svdstudio.domain.model import *
@@ -41,6 +43,7 @@ def _parse_field(n) -> SvdField:
                  access=_t(n, "access"), read_action=_t(n, "readAction"),
                  modified_write_values=_t(n, "modifiedWriteValues"),
                  write_constraint=_t(n, "writeConstraint"))
+    _mark_line(n, f)
     f.derived_from = n.get("derivedFrom", "")
     f.dim = _parse_dim(n)
     bo = n.find("bitOffset"); bw = n.find("bitWidth")
@@ -74,6 +77,7 @@ def _parse_register(n) -> SvdRegister:
     r.derived_from = n.get("derivedFrom", "")
     r.alternate_register = _t(n, "alternateRegister")
     r.dim = _parse_dim(n)
+    _mark_line(n, r)
     for fn in n.findall("fields/field"):
         r.fields.append(_parse_field(fn))
     for evn in n.findall("enumeratedValues"):
@@ -99,6 +103,7 @@ def _parse_peripheral(n) -> SvdPeripheral:
     p.base_address = _i(n, "baseAddress")
     p.derived_from = n.get("derivedFrom", "")
     p.dim = _parse_dim(n)
+    _mark_line(n, p)
     for ab in n.findall("addressBlock"):
         p.address_blocks.append(AddressBlock(offset=_i(ab, "offset"), size=_i(ab, "size"), usage=_t(ab, "usage", "registers")))
     regs = n.find("registers")
@@ -107,9 +112,84 @@ def _parse_peripheral(n) -> SvdPeripheral:
         for cn in regs.findall("cluster"): p.clusters.append(_parse_cluster(cn))
     return p
 
+# Defensive limits: a hostile or broken vendor file must fail fast with a
+# clear message instead of freezing the workbench.
+MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_REGISTERS = 50000
+MAX_FIELDS = 300000
+
+
+def parse_error_position(error: Exception) -> tuple[int, int]:
+    """Extract (line, column) from an lxml error, or (0, 0) when unknown."""
+    position = getattr(error, "position", None)
+    if isinstance(position, tuple) and len(position) == 2:
+        return int(position[0]), int(position[1])
+    lineno = getattr(error, "lineno", None)
+    offset = getattr(error, "offset", None)
+    if lineno:
+        return int(lineno), int(offset or 0)
+    # lxml sometimes only embeds the position in the message text
+    match = re.search(r"line (\d+), column (\d+)", str(error))
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"line (\d+)", str(error))
+    if match:
+        return int(match.group(1)), 0
+    return 0, 0
+
+
+def _mark_line(element, obj) -> None:
+    """Record the source line of an element on its domain object."""
+    line = getattr(element, "sourceline", None)
+    if line and getattr(obj, "meta", None) is not None:
+        obj.meta.line = int(line)
+
+
+def _count(root, tags: tuple[str, ...]) -> int:
+    return sum(1 for element in root.iter() if element.tag in tags)
+
+
+def _strip_namespaces(tree) -> None:
+    """Vendor files sometimes declare a default xmlns; plain tag lookup
+    would then silently find nothing and yield an empty device."""
+    for element in tree.iter():
+        if isinstance(element.tag, str) and "}" in element.tag:
+            element.tag = element.tag.rsplit("}", 1)[1]
+
+
 def parse_file(path: str) -> SvdDevice:
-    tree = etree.parse(path)
+    import os
+    try:
+        size = os.path.getsize(path)
+    except OSError as error:
+        raise ValueError(f"Cannot read file: {error}") from error
+    if size == 0:
+        raise ValueError("File is empty")
+    if size > MAX_FILE_BYTES:
+        raise ValueError(
+            f"File is {size / 1024 / 1024:.1f} MB, over the "
+            f"{MAX_FILE_BYTES / 1024 / 1024:.0f} MB safety limit; "
+            "split it or use the CLI to inspect it in parts")
+    parser = etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False,
+                             remove_comments=True)
+    try:
+        tree = etree.parse(path, parser)
+    except etree.XMLSyntaxError as error:
+        raise ValueError(f"XML is not well-formed: {error}") from error
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Cannot read file: {error}") from error
+    _strip_namespaces(tree)
     root = tree.getroot()
+    if root.tag != "device":
+        raise ValueError(f"Root element is <{root.tag}>, expected <device>; not an SVD file")
+    registers = sum(1 for _ in root.iter("register"))
+    if registers > MAX_REGISTERS:
+        raise ValueError(f"File declares {registers} registers, over the {MAX_REGISTERS} "
+                         "safety limit; use the CLI to inspect it in parts")
+    fields = sum(1 for _ in root.iter("field"))
+    if fields > MAX_FIELDS:
+        raise ValueError(f"File declares {fields} fields, over the {MAX_FIELDS} "
+                         "safety limit; use the CLI to inspect it in parts")
     dev = SvdDevice(name=_t(root, "name"), version=_t(root, "version"),
                     description=_t(root, "description"), vendor=_t(root, "vendor"),
                     vendor_id=_t(root, "vendorID"), series=_t(root, "series"))
@@ -122,7 +202,9 @@ def parse_file(path: str) -> SvdDevice:
                           mpu_present=_t(cpu, "mpuPresent") == "true", fpu_present=_t(cpu, "fpuPresent") == "true",
                           nvic_prio_bits=_i(cpu, "nvicPrioBits"),
                           vendor_systick_config=_t(cpu, "vendorSystickConfig") == "true")
+        _mark_line(cpu, dev.cpu)
     for pn in root.findall("peripherals/peripheral"):
         dev.peripherals.append(_parse_peripheral(pn))
     dev.meta.source_file = path
+    _mark_line(root, dev)
     return dev

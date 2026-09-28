@@ -16,9 +16,10 @@ class ProjectState:
     dirty: bool = False
 
 def open_svd(path: str) -> tuple[ProjectState, list[V.Issue]]:
-    issues = V.check_wellformed(path)
+    # parse once: parser.parse_file already validates size, XML well-formedness,
+    # root element, namespaces and node caps, and raises a clear ValueError
     dev = svd_parser.parse_file(path)
-    issues += V.semantic_check(dev)
+    issues = V.semantic_check(dev)
     return ProjectState(device=dev, path=path, dirty=False), issues
 
 def save_svd(state: ProjectState, path: str = ""):

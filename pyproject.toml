@@ -1,6 +1,6 @@
 [project]
 name = "svd-studio"
-version = "0.2.0"
+version = "2.0.0"
 description = "A professional CMSIS-SVD workbench for inspect, edit, validate and export"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -39,6 +39,8 @@ Issues = "https://github.com/your-org/svd-studio/issues"
 [project.scripts]
 svdstudio = "svdstudio.cli:main"
 svdstudio-gui = "svdstudio.app:main"
+svdstudio-mcp = "svdstudio.mcp_server:main"
+svdstudio-app = "svdstudio.app:main"
 
 [tool.setuptools.packages.find]
 include = ["svdstudio*"]

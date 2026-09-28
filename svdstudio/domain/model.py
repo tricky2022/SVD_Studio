@@ -20,6 +20,9 @@ class NodeMeta:
     notes: str = ""
     tags: list[str] = field(default_factory=list)
     verified: str = ""
+    # line in the source SVD where this element was parsed from; lets the
+    # validator point at the exact spot in the vendor file
+    line: int = 0
 
 @dataclass
 class EnumValue:

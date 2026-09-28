@@ -16,7 +16,8 @@ htmlcov/
 build/
 dist/
 *.spec.bak
-Releases/SVDStudio.exe
+Releases/*.exe
+resources/version_info.txt
 
 # IDE
 .idea/

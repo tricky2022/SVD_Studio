@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lxml import etree
 from PySide6.QtCore import QFile, QIODevice, QSettings, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QAction, QKeySequence, QUndoStack
 from PySide6.QtUiTools import QUiLoader
@@ -197,12 +196,35 @@ class MainWindow(QMainWindow):
         self.device_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.device_tree.customContextMenuRequested.connect(self._tree_menu)
         self.device_tree.doubleClicked.connect(self._rename_at)
-        self.device_tree.expanded.connect(lambda _: self._sync_breadcrumb())
+        self.device_tree.expanded.connect(self._on_tree_expanded)
+        self.device_tree.collapsed.connect(self._on_tree_collapsed)
         self._apply_texts()
         self._retranslate_panels()
 
+    def _on_tree_expanded(self, proxy_index):
+        self._sync_breadcrumb()
+        self._track_expansion(proxy_index, True)
+
+    def _on_tree_collapsed(self, proxy_index):
+        self._track_expansion(proxy_index, False)
+
+    def _track_expansion(self, proxy_index, expanded: bool):
+        """Remember which objects are expanded so a rebuild can restore them."""
+        if not hasattr(self, "_expanded_ids"):
+            self._expanded_ids: set[int] = set()
+        source = self.proxy.mapToSource(proxy_index)
+        node = source.internalPointer() if source.isValid() else None
+        if node is None:
+            return
+        key = id(node.obj if node.obj is not None else node)
+        if expanded:
+            self._expanded_ids.add(key)
+        else:
+            self._expanded_ids.discard(key)
+
     def _apply_texts(self):
-        self.setWindowTitle(t("app"))
+        from svdstudio import __version__
+        self.setWindowTitle(f"{t('app')} v{__version__}")
         self.search.setPlaceholderText(t("search_ph"))
         self.output.appendPlainText(t("ready"))
 
@@ -242,11 +264,7 @@ class MainWindow(QMainWindow):
                     self._map_delete_selected(target, rows)
                     return True
             if watched is self.bitview.legend:
-                rows = sorted({i.row() for i in self.bitview.legend.selectedIndexes()},
-                              reverse=True)
-                regs = self.bitview.reg
-                targets = [regs.fields[r] for r in rows
-                           if regs is not None and 0 <= r < len(regs.fields)]
+                targets = self.bitview.selected_fields()
                 if targets:
                     self._delete_fields(targets)
                     return True
@@ -478,11 +496,16 @@ class MainWindow(QMainWindow):
             self._lang_actions[lang] = action
         tools_menu = self.menuBar().addMenu(t("tools"))
         tools_menu.addAction(self.actions["validate"])
+        tools_menu.addAction(t("validate_schema"), self.validate_with_schema)
+        tools_menu.addAction(t("copy_diagnostics"), self.copy_diagnostics)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.actions["import"])
         tools_menu.addAction(self.actions["diff"])
         tools_menu.addAction(self.actions["overlay"])
         tools_menu.addAction(self.actions["batch"])
         help_menu = self.menuBar().addMenu(t("help"))
+        help_menu.addAction(t("ai_help"), self.show_ai_help)
+        help_menu.addSeparator()
         help_menu.addAction(t("about"), self.show_about)
 
     def switch_language(self, lang: str):
@@ -520,15 +543,22 @@ class MainWindow(QMainWindow):
             self._update_register_map(self._selected_node.obj)
             self._update_status(self._selected_node)
 
+    def show_ai_help(self):
+        from svdstudio.ui.ai_help import show_ai_help
+        show_ai_help(self)
+
     def show_about(self):
+        from svdstudio import __version__
         QMessageBox.about(
             self, t("about"),
-            "SVD Studio v0.2 — CMSIS-SVD 设备描述工作台\n\n"
+            f"SVD Studio v{__version__} — CMSIS-SVD 设备描述工作台\n\n"
             "打开 / 新建 / 编辑 SVD：设备 → 外设 → 寄存器/集群 → 字段 → 枚举值。\n"
             "右侧属性支持 SVD 标准取值的下拉选择；寄存器地图支持批量添加与多选删除；\n"
             "位图双击空白位可新建字段；问题面板双击可跳转定位。\n\n"
             "工具：表格导入（含 Excel 适配）、设备对比 Diff、Overlay 厂商迁移、批量编辑。\n"
-            "SVD Studio v0.2 — CMSIS-SVD workbench. See docs/ for architecture and roadmap.")
+            "自动化：帮助 → AI 与自动化接口，含 CLI / Python API / MCP 说明。\n"
+            f"SVD Studio v{__version__} — CMSIS-SVD workbench. "
+            "See docs/ for architecture and roadmap.")
 
     def new_device(self):
         from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
@@ -587,16 +617,30 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open SVD", "", "SVD (*.svd *.xml)")
         if not path:
             return
-        try:
-            self.state, issues = P.open_svd(path)
-            self.model.set_device(self.state.device)
-            self._clear_detail_panels()
-            self._selected_node = None
-            self._show_issues(issues)
-            self.workspace_state.setText(Path(path).stem.upper())
-            self.output.appendPlainText(f"Loaded: {path}")
-        except (OSError, ValueError, etree.XMLSyntaxError) as error:
+        from svdstudio.ui.load_worker import load_svd_async
+        self.statusBar().showMessage(f"Loading {Path(path).name}…")
+        load_svd_async(self, path, lambda s, i, e: self._on_open_done(path, s, i, e))
+
+    def _on_open_done(self, path, state, issues, error):
+        if error is not None:
             QMessageBox.critical(self, "Open failed", f"{type(error).__name__}: {error}")
+            self.statusBar().showMessage("Open failed", 5000)
+            return
+        if state is None:  # user cancelled
+            self.statusBar().showMessage("Open cancelled", 3000)
+            return
+        self.state = state
+        self.model.set_device(self.state.device)
+        self._expanded_ids = set()
+        self._map_signature_cache = None
+        self._clear_detail_panels()
+        self._selected_node = None
+        self._last_issues = list(issues)
+        self._show_issues(issues)
+        self.workspace_state.setText(Path(path).stem.upper())
+        self.output.appendPlainText(f"Loaded: {path}")
+        self.statusBar().showMessage(
+            f"Loaded {len(self.state.device.peripherals)} peripheral(s)", 5000)
 
     def save(self):
         if not self.state.device:
@@ -633,7 +677,9 @@ class MainWindow(QMainWindow):
     def revalidate(self):
         if not self.state.device:
             return
-        self._show_issues(V.semantic_check(self.state.device))
+        issues = V.semantic_check(self.state.device)
+        self._last_issues = list(issues)
+        self._show_issues(issues)
 
     def _on_search_text(self, text: str):
         from svdstudio.domain import search_utils as SU
@@ -734,25 +780,96 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QColor
         from PySide6.QtWidgets import QListWidgetItem
         self.problems.clear()
+        self._issue_objects = list(issues)
         colors = {"ERROR": QColor("#c0392b"), "WARNING": QColor("#b7791f"), "INFO": QColor("#2e6da4")}
         for issue in issues:
             sev = issue.severity.value.upper()
             marker = {"ERROR": "●", "WARNING": "●"}.get(sev, "○")
-            item = QListWidgetItem(f"{marker} {issue.rule_id}  {issue.path}: {issue.message}")
+            location = issue.location() if hasattr(issue, "location") else issue.path
+            rule = f"{issue.rule_id}  " if issue.rule_id else ""
+            item = QListWidgetItem(f"{marker} {rule}{location}\n     {issue.message}")
             color = colors.get(sev)
             if color is not None:
                 item.setForeground(color)
-            item.setToolTip("双击定位到对象")
+            hint = getattr(issue, "suggestion", "")
+            item.setToolTip(f"{issue.message}\n\n建议: {hint}" if hint
+                            else "双击定位到对象")
             self.problems.addItem(item)
         errors = sum(1 for i in issues if i.severity.value == "error")
         warns = sum(1 for i in issues if i.severity.value == "warning")
-        self.output.appendPlainText(f"Validation: {errors} error(s), {warns} warning(s), {len(issues)} total")
+        infos = len(issues) - errors - warns
+        self.output.appendPlainText(
+            f"Validation: {errors} error(s), {warns} warning(s), {infos} info, "
+            f"{len(issues)} total")
         if errors:
             self.statusBar().showMessage(f"Validation failed: {errors} error(s)")
         elif warns:
             self.statusBar().showMessage(f"Validation passed with {warns} warning(s)")
         else:
             self.statusBar().showMessage("Validation passed")
+
+    def _diagnostic_report(self) -> str:
+        """Shareable text report: file, tool version and every issue with a line."""
+        from svdstudio import __version__
+        lines = [
+            f"SVD Studio v{__version__} diagnostic report",
+            f"file: {self.state.path or '(unsaved)'}",
+            f"device: {getattr(self.state.device, 'name', '')}",
+            "",
+        ]
+        for issue in getattr(self, "_issue_objects", []) or self._last_issues:
+            lines.append(issue.to_line() if hasattr(issue, "to_line")
+                         else f"[{issue.severity.value.upper()}] {issue.path}: {issue.message}")
+            hint = getattr(issue, "suggestion", "")
+            if hint:
+                lines.append(f"    hint: {hint}")
+        if len(lines) == 4:
+            lines.append("No issues reported.")
+        return "\n".join(lines)
+
+    def copy_diagnostics(self):
+        from PySide6.QtWidgets import QApplication
+        report = self._diagnostic_report()
+        QApplication.clipboard().setText(report)
+        self.output.appendPlainText(report)
+        self.statusBar().showMessage("诊断报告已复制到剪贴板", 4000)
+
+    def validate_with_schema(self):
+        """Validate against the official CMSIS-SVD XSD (local copy required)."""
+        from PySide6.QtWidgets import QFileDialog
+
+        from svdstudio.validators import xsd as X
+        if not self.state.path:
+            QMessageBox.information(self, t("validate_schema"),
+                                    "请先保存文件，再使用官方 Schema 校验。")
+            return
+        remembered = self._settings_value("schema_path", "")
+        start = remembered or str(Path(self.state.path).parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self, t("validate_schema"), start, "XML Schema (*.xsd)")
+        if not path:
+            return
+        self._settings_value("schema_path", path, store=True)
+        issues = X.validate_xsd(self.state.path, path)
+        if not issues:
+            self.output.appendPlainText(f"Schema OK: {Path(path).name}")
+            QMessageBox.information(self, t("validate_schema"),
+                                    f"符合官方 Schema：{Path(path).name}")
+            return
+        self._show_issues(issues + list(self._last_issues))
+        self.problems.setCurrentRow(0)
+        QMessageBox.warning(
+            self, t("validate_schema"),
+            f"Schema 校验发现 {len(issues)} 处不符合，已显示在问题面板。\n"
+            "双击问题项可跳转，或使用“复制诊断报告”反馈给厂商。")
+
+    def _settings_value(self, key: str, value=None, store: bool = False):
+        from PySide6.QtCore import QSettings
+        settings = QSettings("SVD Studio", "SVD Studio")
+        if store:
+            settings.setValue(key, value)
+            return value
+        return settings.value(key, value)
 
     def _select(self, index):
         source_index = self.proxy.mapToSource(index)
@@ -795,6 +912,25 @@ class MainWindow(QMainWindow):
         elif path:
             self.statusBar().showMessage(path)
 
+    @staticmethod
+    def _map_signature(target) -> tuple:
+        """Cheap fingerprint of the register table; unchanged => no rebuild."""
+        return (id(target), target.base_address,
+                tuple((r.name, r.address_offset, r.access or "", r.reset_value,
+                       r.description or "", len(r.fields))
+                      for r in sorted(target.registers, key=lambda x: x.address_offset)))
+
+    def _map_row_for(self, view, obj) -> int:
+        """Row of obj in the current map model, or -1."""
+        model = view.model()
+        if model is None:
+            return -1
+        for row in range(model.rowCount()):
+            item = model.item(row, 1)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) is obj:
+                return row
+        return -1
+
     def _update_register_map(self, obj):
         from PySide6.QtGui import QStandardItem, QStandardItemModel
 
@@ -811,8 +947,27 @@ class MainWindow(QMainWindow):
                 target = parent_obj
         if target is None:
             return
+
+        signature = self._map_signature(target)
+        if signature == getattr(self, "_map_signature_cache", None):
+            # same peripheral, same contents: only move the highlighted row.
+            # Rebuilding 5 columns x N rows of QStandardItems here was the
+            # bulk of the "switch register -> lag" feeling.
+            if isinstance(obj, SvdRegister):
+                row = self._map_row_for(view, obj)
+                if row >= 0:
+                    was_loading, self._map_loading = self._map_loading, True
+                    try:
+                        view.selectRow(row)
+                        view.scrollTo(view.model().index(row, 0))
+                    finally:
+                        self._map_loading = was_loading
+            return
+        self._map_signature_cache = signature
+
         from PySide6.QtWidgets import QHeaderView as _HV
         self._map_loading = True
+        view.setUpdatesEnabled(False)
         try:
             model = QStandardItemModel(0, 5)
             model.setHorizontalHeaderLabels([t("offset"), t("name"), t("access"), t("reset"), t("description")])
@@ -833,47 +988,49 @@ class MainWindow(QMainWindow):
                 cells[2].setToolTip(t("map_tip_access"))
                 cells[3].setToolTip(t("map_tip_reset"))
                 model.appendRow(cells)
+            view.setModel(model)
+            model.itemChanged.connect(self._on_map_item_changed)
+            view.setAlternatingRowColors(True)
+            view.setSelectionBehavior(view.SelectionBehavior.SelectRows)
+            view.setSelectionMode(view.SelectionMode.ExtendedSelection)
+            view.setEditTriggers(view.EditTrigger.DoubleClicked
+                                 | view.EditTrigger.EditKeyPressed
+                                 | view.EditTrigger.AnyKeyPressed)
+            from svdstudio.ui.delegates import AccessDelegate
+            if not getattr(view, "_svd_access_delegate", False):
+                view.setItemDelegateForColumn(2, AccessDelegate(view))
+                view._svd_access_delegate = True
+            header = view.horizontalHeader()
+            header.setStretchLastSection(True)
+            header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, _HV.ResizeMode.Interactive)
+            header.setSectionResizeMode(2, _HV.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, _HV.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, _HV.ResizeMode.Stretch)
+            header.setMinimumSectionSize(70)
+            view.setColumnWidth(0, 190)
+            view.setColumnWidth(1, 210)
+            view.setColumnWidth(2, 120)
+            view.setColumnWidth(3, 140)
+            view.verticalHeader().setVisible(False)
+            # bidirectional link: click a map row -> select register in tree.
+            # Connected exactly once per view (guard flag: blind disconnect()
+            # emits RuntimeWarning spam on the PyCharm console).
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            if not getattr(view, "_svd_wired", False):
+                view.clicked.connect(self._on_map_clicked)
+                view.customContextMenuRequested.connect(self._on_map_menu)
+                view._svd_wired = True
+            view.setProperty("svd_target", target.name)
+            # highlight the currently selected register row
+            if isinstance(obj, SvdRegister):
+                row = self._map_row_for(view, obj)
+                if row >= 0:
+                    view.selectRow(row)
+                    view.scrollTo(model.index(row, 0))
         finally:
             self._map_loading = False
-        view.setModel(model)
-        model.itemChanged.connect(self._on_map_item_changed)
-        view.setAlternatingRowColors(True)
-        view.setSelectionBehavior(view.SelectionBehavior.SelectRows)
-        view.setSelectionMode(view.SelectionMode.ExtendedSelection)
-        view.setEditTriggers(view.EditTrigger.DoubleClicked | view.EditTrigger.EditKeyPressed
-                             | view.EditTrigger.AnyKeyPressed)
-        from svdstudio.ui.delegates import AccessDelegate
-        if not getattr(view, "_svd_access_delegate", False):
-            view.setItemDelegateForColumn(2, AccessDelegate(view))
-            view._svd_access_delegate = True
-        header = view.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, _HV.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, _HV.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, _HV.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, _HV.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, _HV.ResizeMode.Stretch)
-        header.setMinimumSectionSize(70)
-        view.setColumnWidth(0, 190)
-        view.setColumnWidth(1, 210)
-        view.setColumnWidth(2, 120)
-        view.setColumnWidth(3, 140)
-        view.verticalHeader().setVisible(False)
-        # bidirectional link: click a map row -> select register in tree.
-        # Connected exactly once per view (guard flag: blind disconnect()
-        # emits RuntimeWarning spam on the PyCharm console).
-        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        if not getattr(view, "_svd_wired", False):
-            view.clicked.connect(self._on_map_clicked)
-            view.customContextMenuRequested.connect(self._on_map_menu)
-            view._svd_wired = True
-        view.setProperty("svd_target", target.name)
-        # highlight the currently selected register row
-        if isinstance(obj, SvdRegister):
-            for row in range(model.rowCount()):
-                if model.item(row, 1) is not None and model.item(row, 1).text() == obj.name:
-                    view.selectRow(row)
-                    break
+            view.setUpdatesEnabled(True)
 
     def _on_map_clicked(self, index):
         view = self.findChild(QWidget, "registerMapView")
@@ -1058,19 +1215,12 @@ class MainWindow(QMainWindow):
         self.state.dirty = True
 
     def _select_object(self, obj):
-        """Find obj in the tree model and select it (tree<->map<->bitview sync)."""
-        def walk(parent):
-            for r in range(self.model.rowCount(parent)):
-                idx = self.model.index(r, 0, parent)
-                node = idx.internalPointer()
-                if node is not None and node.obj is obj:
-                    return idx
-                found = walk(idx)
-                if found is not None and found.isValid():
-                    return found
-            return None
-        from PySide6.QtCore import QModelIndex
-        source = walk(QModelIndex())
+        """Find obj in the tree model and select it (tree<->map<->bitview sync).
+
+        Uses the model's object index, so the cost is O(depth) instead of a
+        full recursive walk on every map click.
+        """
+        source = self.model.source_index_for(obj)
         if source is not None and source.isValid():
             proxy_idx = self.proxy.mapFromSource(source)
             self.device_tree.setCurrentIndex(proxy_idx)
@@ -1082,10 +1232,24 @@ class MainWindow(QMainWindow):
         dialog = ImportWizardDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        try:
-            result = dialog.import_result(self)
-        except (OSError, ValueError, RuntimeError) as error:
-            QMessageBox.critical(self, "Import failed", f"{type(error).__name__}: {error}")
+        # read widget state on the GUI thread, then run the heavy import
+        # (CSV/XLSX parsing + domain build) in the background
+        request = dialog.import_request()
+        if request is None:
+            return
+        from svdstudio.application.tabular_import import import_file
+        from svdstudio.ui.load_worker import run_async
+
+        run_async(self, lambda: import_file(*request), self._on_import_done,
+                  "Importing table…", "Import table")
+
+    def _on_import_done(self, result, error):
+        if error is not None:
+            QMessageBox.critical(self, "Import failed",
+                                 f"{type(error).__name__}: {error}")
+            return
+        if result is None:  # cancelled
+            self.statusBar().showMessage("Import cancelled", 3000)
             return
         if not result.valid:
             self.output.appendPlainText("Import issues:\n" + "\n".join(
@@ -1098,13 +1262,17 @@ class MainWindow(QMainWindow):
         self.state.path = ""
         self.state.dirty = True
         self.model.set_device(result.device)
-        self.undo.push(CM.InsertCommand(result.device.peripherals, result.device.peripherals[0],
-                                        0, "Import table", self._refresh))
-        self.undo.pop()
+        if result.device.peripherals:
+            self.undo.push(CM.InsertCommand(result.device.peripherals,
+                                            result.device.peripherals[0],
+                                            0, "Import table", self._refresh))
+            self.undo.pop()
         self._refresh()
         self.output.appendPlainText(
             f"Imported: {result.peripherals_created} peripheral(s), "
             f"{result.registers_created} register(s), {result.fields_created} field(s)")
+        self.statusBar().showMessage(
+            f"Import done: {len(result.device.peripherals)} peripheral(s)", 5000)
 
     def edit_enums(self):
         from svdstudio.domain.model import SvdField
@@ -1132,16 +1300,21 @@ class MainWindow(QMainWindow):
         _ = old_groups
 
     def run_diff(self):
-        from svdstudio.domain import diff as DD
         path, _ = QFileDialog.getOpenFileName(self, "Compare with SVD", "", "SVD (*.svd *.xml)")
         if not path or self.state.device is None:
             return
-        try:
-            from svdstudio.infrastructure import svd_parser
-            other = svd_parser.parse_file(path)
-        except (OSError, ValueError) as error:
+        from svdstudio.ui.load_worker import load_svd_async
+        self.statusBar().showMessage(f"Loading {Path(path).name} for diff…")
+        load_svd_async(self, path, lambda s, i, e: self._on_diff_done(path, s, e))
+
+    def _on_diff_done(self, path, state, error):
+        if error is not None:
             QMessageBox.critical(self, "Diff failed", f"{type(error).__name__}: {error}")
             return
+        if state is None:  # user cancelled
+            return
+        from svdstudio.domain import diff as DD
+        other = state.device
         report = DD.diff_devices(self.state.device, other)
         self.output.appendPlainText(f"Diff vs {path} ({len(report.entries)} entries):\n"
                                     + (report.to_text() or "(no differences)"))
@@ -1333,15 +1506,14 @@ class MainWindow(QMainWindow):
         reg = self.bitview.reg
         if reg is None:
             return
-        rows = sorted({i.row() for i in self.bitview.legend.selectedIndexes()})
+        picked = self.bitview.selected_fields()
         menu = QMenu(self)
         menu.addAction(t("field_batch"), self._batch_add_fields)
-        if rows:
+        if picked:
             menu.addSeparator()
-            menu.addAction(t("field_delete_multi").format(count=len(rows)),
-                           lambda: self._delete_fields(
-                               [reg.fields[r] for r in rows if 0 <= r < len(reg.fields)]))
-            if len(rows) == 1:
+            menu.addAction(t("field_delete_multi").format(count=len(picked)),
+                           lambda: self._delete_fields(picked))
+            if len(picked) == 1:
                 menu.addAction(t("rename"), self._rename_field_from_menu)
         menu.exec(global_pos)
 
@@ -1418,43 +1590,64 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(t("field_batch_done").format(count=len(plan)), 4000)
 
     def _refresh(self):
-        if not self.state.device:
+        if not self.state.device or getattr(self, "_refreshing", False):
+            # coalesce: a rebuild triggered from inside a rebuild must not
+            # recurse (that was the register-switch lag and the undo spam)
+            self._refresh_pending = True
             return
-        # preserve expansion + selection across CRUD so the tree never collapses
-        expanded: set[int] = set()
-        def collect(parent, prefix=""):
-            for r in range(self.model.rowCount(parent)):
-                idx = self.model.index(r, 0, parent)
-                node = idx.internalPointer()
-                key = f"{prefix}/{getattr(node.obj, 'name', node.label) if node else ''}"
-                if self.device_tree.isExpanded(self.proxy.mapFromSource(idx)):
-                    expanded.add(key)
-                collect(idx, key)
-        from PySide6.QtCore import QModelIndex
-        collect(QModelIndex())
+        self._refreshing = True
+        try:
+            self._rebuild_views()
+        finally:
+            self._refreshing = False
+        if getattr(self, "_refresh_pending", False):
+            self._refresh_pending = False
+            self._refresh()
+
+    def _rebuild_views(self):
         selected_obj = self._selected_node.obj if self._selected_node else None
+        # expansion is tracked incrementally by the expanded/collapsed signals,
+        # so restoring costs O(expanded) instead of a walk over every node
+        expanded_ids = set(getattr(self, "_expanded_ids", ()))
         self.model.set_device(self.state.device)
-        def restore(parent, prefix=""):
-            for r in range(self.model.rowCount(parent)):
-                idx = self.model.index(r, 0, parent)
-                node = idx.internalPointer()
-                key = f"{prefix}/{getattr(node.obj, 'name', node.label) if node else ''}"
-                if key in expanded:
-                    self.device_tree.expand(self.proxy.mapFromSource(idx))
-                if node is not None and node.obj is selected_obj:
-                    proxy_idx = self.proxy.mapFromSource(idx)
-                    self.device_tree.setCurrentIndex(proxy_idx)
-                    self._selected_node = node
-                restore(idx, key)
-        restore(QModelIndex())
-        # re-sync detail panels so map/bitview/props follow the mutation
+        self._expanded_ids = set()
+        if selected_obj is not None:
+            source = self.model.source_index_for(selected_obj)
+            if source.isValid():
+                self._selected_node = source.internalPointer()
+        self._restore_expansion(expanded_ids)
         if self._selected_node is not None:
+            proxy_idx = self.proxy.mapFromSource(
+                self.model.source_index_for(self._selected_node.obj))
+            if proxy_idx.isValid():
+                self.device_tree.setCurrentIndex(proxy_idx)
             self._show_object(self._selected_node.obj)
             from svdstudio.domain.model import SvdRegister as _SR
             self.bitview.set_register(
                 self._selected_node.obj if isinstance(self._selected_node.obj, _SR) else None)
             self._update_register_map(self._selected_node.obj)
             self._update_status(self._selected_node)
+
+    def _restore_expansion(self, expanded_ids: set[int]):
+        """Re-expand only the paths that were open before the rebuild."""
+        if not expanded_ids:
+            return
+        from PySide6.QtCore import QModelIndex
+
+        def walk(parent_index, node):
+            for row in range(self.model.rowCount(parent_index)):
+                child_index = self.model.index(row, 0, parent_index)
+                child = child_index.internalPointer()
+                if child is None:
+                    continue
+                if id(child.obj) in expanded_ids:
+                    proxy_index = self.proxy.mapFromSource(child_index)
+                    if proxy_index.isValid():
+                        self.device_tree.expand(proxy_index)
+                        self._expanded_ids.add(id(child.obj))
+                        walk(child_index, child)
+
+        walk(QModelIndex(), self.model.root)
 
     def _selected_collection(self):
         node = self._selected_node

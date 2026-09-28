@@ -44,6 +44,7 @@ class _BitCanvas(QWidget):
         self._menu_signal = menu_signal
         self._rects: list[tuple[QRect, SvdField]] = []
         self._hover: SvdField | None = None
+        self._selected: SvdField | None = None
         self.setMinimumWidth(420)
         self.setFixedHeight(CANVAS_HEIGHT)
         self.setMouseTracking(True)
@@ -60,6 +61,14 @@ class _BitCanvas(QWidget):
     def set_register(self, register: SvdRegister | None):
         self.reg = register
         self._hover = None
+        self._selected = None
+        self.update()
+
+    def set_selected(self, field: SvdField | None):
+        """Highlight a field on the canvas (driven by table selection)."""
+        if field is self._selected:
+            return
+        self._selected = field
         self.update()
 
     def _bit_at(self, x: float) -> int | None:
@@ -171,7 +180,11 @@ class _BitCanvas(QWidget):
                     painter.fillRect(x, ROW_BITS_TOP + ROW_BITS_HEIGHT - 5,
                                      max(1, int(cell) + 1), 5, QColor("#f2c14e"))
 
-            if field is self._hover:
+            if field is self._selected:
+                painter.setPen(QPen(QColor(99, 117, 216, 160), 4))
+                painter.drawRect(rect.adjusted(-2, -2, 2, 2))
+                painter.setPen(QPen(QColor("#ffffff"), 2))
+            elif field is self._hover:
                 painter.setPen(QPen(QColor("#ffffff"), 2))
             else:
                 painter.setPen(QPen(QColor(0, 0, 0, 70), 1))
@@ -244,7 +257,7 @@ class BitView(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setMinimumSectionSize(56)
         self.legend.setColumnWidth(0, 170)
-        self.legend.cellClicked.connect(self._legend_clicked)
+        self.legend.itemSelectionChanged.connect(self._legend_selection_changed)
         self.legend.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.legend.customContextMenuRequested.connect(self._on_legend_menu)
         self.canvas.fieldClicked.connect(self._canvas_clicked)
@@ -271,11 +284,19 @@ class BitView(QWidget):
         self.canvas.set_register(register)
         if changed and register is not None:
             self._fade_canvas()
+        # the loading guard must cover the whole rebuild: inserting cells emits
+        # itemChanged, and an unguarded emit would push undo commands (and a
+        # full view rebuild) for every cell just written
         self._legend_loading = True
+        self.legend.blockSignals(True)
         try:
-            self.legend.setRowCount(0)
+            self._fill_legend(register)
         finally:
+            self.legend.blockSignals(False)
             self._legend_loading = False
+
+    def _fill_legend(self, register: SvdRegister | None):
+        self.legend.setRowCount(0)
         if register is None:
             self.title.setText(t("bit_layout_title"))
             return
@@ -283,23 +304,11 @@ class BitView(QWidget):
             f"{t('bit_layout_title')}  ·  {register.name}  ·  {register.size}-bit  ·  "
             f"{len(register.fields)} {t('f_field')}(s)"
         )
-        for field in register.fields:
+        # LSB-first: bit 0 at the top, matching how engineers read the map
+        for field in sorted(register.fields, key=lambda f: (f.bit_offset, f.bit_width)):
             row = self.legend.rowCount()
             self.legend.insertRow(row)
-            reset = "—" if field.reset_value is None else hex(field.reset_value)
-            enum_note = ""
-            if field.enumerated_values:
-                count = sum(len(item.values) for item in field.enumerated_values)
-                enum_note = f"  [{count} enum]"
-            values = (
-                field.name,
-                bits_text(field),
-                str(field.bit_width),
-                field.access or "—",
-                reset,
-                (field.description or "") + enum_note,
-            )
-            for column, value in enumerate(values):
+            for column, value in enumerate(self._row_values(field)):
                 cell = QTableWidgetItem(value)
                 if column in self.EDITABLE_COLUMNS:
                     cell.setToolTip(t("legend_tip_edit"))
@@ -307,6 +316,22 @@ class BitView(QWidget):
                     cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 cell.setData(Qt.ItemDataRole.UserRole, field)
                 self.legend.setItem(row, column, cell)
+
+    @staticmethod
+    def _row_values(field: SvdField) -> tuple:
+        """Canonical display text; also the reference for change detection."""
+        enum_note = ""
+        if field.enumerated_values:
+            count = sum(len(item.values) for item in field.enumerated_values)
+            enum_note = f"  [{count} enum]"
+        return (
+            field.name,
+            bits_text(field),
+            str(field.bit_width),
+            field.access or "—",
+            "—" if field.reset_value is None else hex(field.reset_value),
+            (field.description or "") + enum_note,
+        )
 
     @staticmethod
     def parse_bits(text: str) -> tuple[int, int] | None:
@@ -332,11 +357,15 @@ class BitView(QWidget):
         if field is None or attr is None or self.reg is None or field not in self.reg.fields:
             return
         text = item.text().strip()
+        # canonical display comparison first: rebuilding the table must never
+        # look like an edit (that is what wrote "—" into access and triggered
+        # an undo push + full refresh per cell)
+        shown = self._row_values(field)[item.column()].strip()
+        if text == shown:
+            return
         if attr == "name":
             if not text or any(f is not field and f.name == text for f in self.reg.fields):
                 self.set_register(self.reg)  # revert invalid rename
-                return
-            if text == field.name:
                 return
             self.fieldEdited.emit(field, attr, text)
             return
@@ -348,15 +377,19 @@ class BitView(QWidget):
                     parsed = (field.lsb, width) if width >= 1 else None
                 except ValueError:
                     parsed = None
-            if parsed is None or parsed == (field.lsb, field.bit_width):
-                if parsed is None:
-                    self.set_register(self.reg)  # revert invalid geometry text
+            if parsed is None:
+                self.set_register(self.reg)  # revert invalid geometry text
+                return
+            if parsed == (field.lsb, field.bit_width):
                 return
             self.fieldMoved.emit(field, parsed[0], parsed[1])
             return
-        if text == (getattr(field, attr) or ""):
-            if attr == "access" and item.text() != (field.access or "—"):
+        if attr == "access":
+            value = "" if text in ("—", "-") else text
+            if value == (field.access or ""):
                 self.set_register(self.reg)  # normalize the "—" display
+                return
+            self.fieldEdited.emit(field, attr, value)
             return
         self.fieldEdited.emit(field, attr, text)
 
@@ -378,14 +411,38 @@ class BitView(QWidget):
     def _on_legend_menu(self, pos):
         self.legendMenuRequested.emit(self.legend.mapToGlobal(pos))
 
+    def selected_fields(self) -> list:
+        """Field objects behind the selected legend rows (LSB-first display)."""
+        fields = self.reg.fields if self.reg is not None else []
+        picked, seen = [], set()
+        for row in sorted({i.row() for i in self.legend.selectedIndexes()}):
+            item = self.legend.item(row, 0)
+            field = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if field is not None and field in fields and id(field) not in seen:
+                seen.add(id(field))
+                picked.append(field)
+        return picked
+
     def _canvas_clicked(self, field: SvdField):
         self._select_field(field)
 
-    def _legend_clicked(self, row, _column):
-        if self.reg is not None and 0 <= row < len(self.reg.fields):
-            self._select_field(self.reg.fields[row])
+    def _legend_selection_changed(self):
+        picked = self.selected_fields()
+        if not picked:
+            return
+        self.canvas.set_selected(picked[0])
+        self.fieldClicked.emit(picked[0])
 
     def _select_field(self, field: SvdField):
         if self.reg is not None and field in self.reg.fields:
-            self.legend.selectRow(self.reg.fields.index(field))
+            self.legend.blockSignals(True)
+            try:
+                for row in range(self.legend.rowCount()):
+                    item = self.legend.item(row, 0)
+                    if item is not None and item.data(Qt.ItemDataRole.UserRole) is field:
+                        self.legend.selectRow(row)
+                        break
+            finally:
+                self.legend.blockSignals(False)
+            self.canvas.set_selected(field)
         self.fieldClicked.emit(field)
