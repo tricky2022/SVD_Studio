@@ -7,17 +7,20 @@ from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from svdstudio.domain.model import SvdField, SvdRegister
 from svdstudio.ui.i18n import t
+from svdstudio.ui.icons import icon as app_icon
 
 PALETTE = [
     QColor("#3f78a8"), QColor("#c2762b"), QColor("#4f9660"), QColor("#b64d53"),
@@ -221,6 +224,8 @@ class BitView(QWidget):
     fieldEdited = Signal(object, str, object)
     fieldMoved = Signal(object, int, int)  # field, new lsb, new width
     createRequested = Signal(int)
+    addRequested = Signal()       # header "+" button: single field
+    batchAddRequested = Signal()  # header batch button: batch fields
     canvasMenuRequested = Signal(int, object)  # bit (-1 when none), global pos
     legendMenuRequested = Signal(object)  # global pos; rows resolved by the window
 
@@ -262,10 +267,29 @@ class BitView(QWidget):
         self.legend.customContextMenuRequested.connect(self._on_legend_menu)
         self.canvas.fieldClicked.connect(self._canvas_clicked)
 
+        header = QWidget()
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(2)
+        header_row.addWidget(self.title)
+        header_row.addStretch(1)
+        self._add_btn = QToolButton()
+        self._add_btn.setIcon(app_icon("new"))
+        self._add_btn.setToolTip("新建字段")
+        self._add_btn.setAutoRaise(True)
+        self._add_btn.clicked.connect(self.addRequested.emit)
+        self._batch_btn = QToolButton()
+        self._batch_btn.setIcon(app_icon("add"))
+        self._batch_btn.setToolTip("批量添加字段…")
+        self._batch_btn.setAutoRaise(True)
+        self._batch_btn.clicked.connect(self.batchAddRequested.emit)
+        header_row.addWidget(self._add_btn)
+        header_row.addWidget(self._batch_btn)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        layout.addWidget(self.title)
+        layout.addWidget(header)
         layout.addWidget(self.canvas)
         layout.addWidget(self.legend, 1)
 

@@ -156,10 +156,13 @@ class MainWindow(QMainWindow):
             # insert above the register map (index 0 = map view; keep title on top)
             layout = map_layout.layout()
             # constant strip height: the map area never reflows on selection.
-            self._memory_map.setFixedHeight(84)
+            # 56px fits two address-block rows; content only, never geometry.
+            self._memory_map.setFixedHeight(56)
             layout.insertWidget(layout.count() - 1, self._memory_map)
+            self._build_map_header(layout)
         else:
             self._memory_map = None
+            self._map_add_btn = self._map_batch_btn = self._map_del_btn = None
         self.props.valueEdited.connect(self._edit)
         self.bitview.fieldClicked.connect(self._show_object)
         self.bitview.fieldEdited.connect(self._edit_field_from_legend)
@@ -167,6 +170,8 @@ class MainWindow(QMainWindow):
         self.bitview.canvasMenuRequested.connect(self._bit_canvas_menu)
         self.bitview.legendMenuRequested.connect(self._legend_menu)
         self.bitview.createRequested.connect(self._create_field_at_bit)
+        self.bitview.addRequested.connect(self._add_single_field)
+        self.bitview.batchAddRequested.connect(self._batch_add_fields)
         # Eclipse-style problems: double-click jumps, jump icon per row
         self.problems.itemDoubleClicked.connect(lambda _: self._jump_to_problem())
         # lower tabs take less default height; small status icons like Eclipse
@@ -178,6 +183,80 @@ class MainWindow(QMainWindow):
                 lower.setTabIcon(0, app_icon("warning"))
                 lower.setTabIcon(1, app_icon("info"))
                 lower.setIconSize(QSize(12, 12))
+            self._build_diag_corner(lower)
+
+    def _build_diag_corner(self, tabs):
+        """IDEA-style diagnostics toolbar sharing the tab row (zero extra height).
+
+        Severity toggles with live counts + clear, all in the same row as the
+        Problems/Output tabs via QTabWidget corner widget.
+        """
+        from PySide6.QtWidgets import QHBoxLayout, QToolButton, QWidget
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 2, 0)
+        row.setSpacing(2)
+        self._flt_err = QToolButton()
+        self._flt_err.setIcon(app_icon("error"))
+        self._flt_err.setCheckable(True)
+        self._flt_err.setChecked(True)
+        self._flt_err.setToolTip(t("filter_errors"))
+        self._flt_err.setAutoRaise(True)
+        self._flt_err.toggled.connect(lambda _: self._apply_problem_filter())
+        self._flt_warn = QToolButton()
+        self._flt_warn.setIcon(app_icon("warning"))
+        self._flt_warn.setCheckable(True)
+        self._flt_warn.setChecked(True)
+        self._flt_warn.setToolTip(t("filter_warnings"))
+        self._flt_warn.setAutoRaise(True)
+        self._flt_warn.toggled.connect(lambda _: self._apply_problem_filter())
+        self._flt_info = QToolButton()
+        self._flt_info.setIcon(app_icon("info"))
+        self._flt_info.setCheckable(True)
+        self._flt_info.setChecked(True)
+        self._flt_info.setToolTip(t("filter_infos"))
+        self._flt_info.setAutoRaise(True)
+        self._flt_info.toggled.connect(lambda _: self._apply_problem_filter())
+        clear = QToolButton()
+        clear.setIcon(app_icon("delete"))
+        clear.setToolTip(t("clear_panel"))
+        clear.setAutoRaise(True)
+        clear.clicked.connect(self._clear_diag_panel)
+        from PySide6.QtCore import Qt as _Qt
+        for btn in (self._flt_err, self._flt_warn, self._flt_info):
+            btn.setToolButtonStyle(_Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            row.addWidget(btn)
+        row.addWidget(clear)
+        tabs.setCornerWidget(bar, _Qt.Corner.TopRightCorner)
+
+    def _apply_problem_filter(self):
+        """Show only the enabled severities; counts stay on the buttons."""
+        show_err = self._flt_err.isChecked()
+        show_warn = self._flt_warn.isChecked()
+        show_info = self._flt_info.isChecked()
+        for row in range(self.problems.count()):
+            item = self.problems.item(row)
+            sev = item.data(Qt.ItemDataRole.UserRole) or ""
+            visible = ((sev == "ERROR" and show_err)
+                       or (sev == "WARNING" and show_warn)
+                       or (sev not in ("ERROR", "WARNING") and show_info))
+            item.setHidden(not visible)
+
+    def _update_problem_counts(self, errors: int, warns: int, infos: int):
+        self._flt_err.setText(str(errors))
+        self._flt_warn.setText(str(warns))
+        self._flt_info.setText(str(infos))
+        self._flt_err.setToolTip(f"{t('filter_errors')} ({errors})")
+        self._flt_warn.setToolTip(f"{t('filter_warnings')} ({warns})")
+        self._flt_info.setToolTip(f"{t('filter_infos')} ({infos})")
+
+    def _clear_diag_panel(self):
+        if self.findChild(QWidget, "lowerTabs").currentIndex() == 1:
+            self.output.clear()
+        else:
+            self.problems.clear()
+            self._update_problem_counts(0, 0, 0)
+            self.statusBar().showMessage("问题面板已清空（下次校验时重新填充）", 3000)
 
     def _configure_layout(self):
         self.workspace_header.hide()
@@ -738,6 +817,26 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("No matches")
 
+    def _add_single_field(self):
+        """Header "+" button: open the field dialog at the first free bit."""
+        from svdstudio.domain.model import SvdRegister
+        node = self._selected_node
+        reg = None
+        if node is not None and isinstance(node.obj, SvdRegister):
+            reg = node.obj
+        elif self.bitview.reg is not None:
+            reg = self.bitview.reg
+        if reg is None:
+            self.statusBar().showMessage("请先选中一个寄存器", 3000)
+            return
+        size = reg.size_value
+        used = [False] * size
+        for f in reg.fields:
+            for b in range(max(0, f.bit_offset), min(size, f.bit_offset + f.bit_width)):
+                used[b] = True
+        bit = next((b for b, u in enumerate(used) if not u), 0)
+        self._create_field_at_bit(bit)
+
     def _create_field_at_bit(self, bit: int):
         from svdstudio.domain.model import SvdRegister
         node = self._selected_node
@@ -831,6 +930,7 @@ class MainWindow(QMainWindow):
             color = _color(sev)
             if color is not None:
                 item.setForeground(color)
+            item.setData(Qt.ItemDataRole.UserRole, sev)
             hint = getattr(issue, "suggestion", "")
             item.setToolTip(f"{issue.message}\n\n建议: {hint}" if hint
                             else "双击定位到对象")
@@ -838,6 +938,8 @@ class MainWindow(QMainWindow):
         errors = sum(1 for i in issues if i.severity.value == "error")
         warns = sum(1 for i in issues if i.severity.value == "warning")
         infos = len(issues) - errors - warns
+        self._update_problem_counts(errors, warns, infos)
+        self._apply_problem_filter()
         self.output.appendPlainText(
             f"Validation: {errors} error(s), {warns} warning(s), {infos} info, "
             f"{len(issues)} total")
@@ -1512,6 +1614,64 @@ class MainWindow(QMainWindow):
         """Single funnel for the property panel so every selection path stays in sync."""
         self.props.set_object(obj)
         self._sync_memory_map(obj)
+
+    def _build_map_header(self, layout):
+        """Title row with Eclipse-style icon actions on the right.
+
+        Icon-only keeps the dense professional look; tooltips + status tips
+        carry the meaning. Buttons resolve the current peripheral context on
+        click, so they never act on a stale target.
+        """
+        from PySide6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        label = QLabel(t("register_map"))
+        row.addWidget(label)
+        row.addStretch(1)
+        self._map_add_btn = QToolButton()
+        self._map_add_btn.setIcon(app_icon("new"))
+        self._map_add_btn.setToolTip("新建寄存器 (右键也有批量/删除)")
+        self._map_add_btn.clicked.connect(self._on_map_add_clicked)
+        self._map_batch_btn = QToolButton()
+        self._map_batch_btn.setIcon(app_icon("add"))
+        self._map_batch_btn.setToolTip("批量添加寄存器…")
+        self._map_batch_btn.clicked.connect(self._on_map_batch_clicked)
+        self._map_del_btn = QToolButton()
+        self._map_del_btn.setIcon(app_icon("delete"))
+        self._map_del_btn.setToolTip("删除选中寄存器")
+        self._map_del_btn.clicked.connect(self._on_map_delete_clicked)
+        for btn in (self._map_add_btn, self._map_batch_btn, self._map_del_btn):
+            btn.setAutoRaise(True)
+            row.addWidget(btn)
+        layout.insertWidget(0, bar)
+
+    def _on_map_add_clicked(self):
+        target = self._map_target()
+        if target is None:
+            self.statusBar().showMessage("请先在左侧选中一个外设", 3000)
+            return
+        self._map_add_register(target)
+
+    def _on_map_batch_clicked(self):
+        target = self._map_target()
+        if target is None:
+            self.statusBar().showMessage("请先在左侧选中一个外设", 3000)
+            return
+        self._map_batch_add(target)
+
+    def _on_map_delete_clicked(self):
+        from PySide6.QtWidgets import QTableView
+        target = self._map_target()
+        view = self.findChild(QTableView, "registerMapView")
+        if target is None or view is None:
+            return
+        rows = sorted({idx.row() for idx in view.selectionModel().selectedRows()})
+        if not rows:
+            self.statusBar().showMessage("请先在寄存器地图中选中行", 3000)
+            return
+        self._map_delete_selected(target, rows)
 
     def _sync_memory_map(self, obj):
         """Update the memory map in place; geometry never changes on select.
