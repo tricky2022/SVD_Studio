@@ -1,22 +1,14 @@
 @echo off
-REM Build the Windows executables into Releases\ (GUI + CLI/MCP console).
-REM   Releases\SVDStudio.exe       GUI (also answers --cli / --mcp)
-REM   Releases\svdstudio-cli.exe   console build for CLI and MCP clients
+REM Build the Windows executables into Releases\ (GUI + console CLI).
 setlocal
 cd /d %~dp0
 if not exist Releases mkdir Releases
 
-.\.venv\Scripts\python -m pip install -q pyinstaller pillow || goto :fail
-
-REM the .ico is a build input; regenerate it so the exe never loses its icon
-.\.venv\Scripts\python tools\make_icon.py || goto :fail
-
-if exist build rmdir /s /q build
+.\.venv\Scripts\python -m pip install -q -e ".[excel,release]" || goto :fail
 .\.venv\Scripts\python -m PyInstaller --noconfirm --clean --distpath Releases SVDStudio.spec || goto :fail
 
 echo.
-echo Verifying the icon and version resource were embedded...
-.\.venv\Scripts\python tools\verify_exe.py || goto :fail
+Releases\svdstudio-cli.exe --version || goto :fail
 
 echo.
 echo Done:

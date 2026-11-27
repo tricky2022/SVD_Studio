@@ -27,6 +27,12 @@ modifiedWriteValues/writeConstraint/enumeratedValues.
 
 Provenance enum: ORIGINAL | MODIFIED | INHERITED | DERIVED | GENERATED | CONFLICT.
 
+CPU feature metadata uses the CMSIS `cpu` element. Debugger-addressed core
+registers have their own group and register types, with register IDs and bit
+ranges. The SVD serializer stores them in the versioned SVD Studio namespace
+under `vendorExtensions`. The TMK XML adapter maps the same domain objects to
+the CPU/FPU profile format used by TMKStudioIDE.
+
 ## 3. Effective model (Phase 5 stub)
 
 `domain/effective.py` exposes `expand_dim()` and `resolve_derived_from()`

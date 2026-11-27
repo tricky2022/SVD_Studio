@@ -1,6 +1,6 @@
 [project]
 name = "svd-studio"
-version = "2.0.0"
+dynamic = ["version"]
 description = "A professional CMSIS-SVD workbench for inspect, edit, validate and export"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -32,18 +32,20 @@ excel = ["openpyxl>=3.1"]
 release = ["pyinstaller>=6.0", "pillow>=10.0"]
 
 [project.urls]
-Homepage = "https://github.com/your-org/svd-studio"
-Repository = "https://github.com/your-org/svd-studio"
-Issues = "https://github.com/your-org/svd-studio/issues"
+Homepage = "https://github.com/tricky2022/SVD_Studio"
+Repository = "https://github.com/tricky2022/SVD_Studio"
+Issues = "https://github.com/tricky2022/SVD_Studio/issues"
 
 [project.scripts]
 svdstudio = "svdstudio.cli:main"
 svdstudio-gui = "svdstudio.app:main"
-svdstudio-mcp = "svdstudio.mcp_server:main"
 svdstudio-app = "svdstudio.app:main"
 
 [tool.setuptools.packages.find]
 include = ["svdstudio*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "svdstudio.__version__" }
 
 [build-system]
 requires = ["setuptools>=61"]

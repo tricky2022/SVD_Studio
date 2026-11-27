@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from svdstudio.domain.model import SvdField, SvdRegister
+from svdstudio.domain.model import CoreRegister, SvdField, SvdRegister
 from svdstudio.ui.i18n import t
 from svdstudio.ui.icons import icon as app_icon
 
@@ -43,7 +43,7 @@ class _BitCanvas(QWidget):
 
     def __init__(self, menu_signal=None):
         super().__init__()
-        self.reg: SvdRegister | None = None
+        self.reg: SvdRegister | CoreRegister | None = None
         self._menu_signal = menu_signal
         self._rects: list[tuple[QRect, SvdField]] = []
         self._hover: SvdField | None = None
@@ -61,7 +61,7 @@ class _BitCanvas(QWidget):
         bit = self._bit_at(pos.x())
         self._menu_signal.emit(bit if bit is not None else -1, self.mapToGlobal(pos))
 
-    def set_register(self, register: SvdRegister | None):
+    def set_register(self, register: SvdRegister | CoreRegister | None):
         self.reg = register
         self._hover = None
         self._selected = None
@@ -236,7 +236,7 @@ class BitView(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.reg: SvdRegister | None = None
+        self.reg: SvdRegister | CoreRegister | None = None
         self._legend_loading = False
         self.canvas = _BitCanvas(menu_signal=self.canvasMenuRequested)
         self.canvas.createRequested.connect(self.createRequested.emit)
@@ -317,17 +317,19 @@ class BitView(QWidget):
             reset_txt = f"  ·  reset {reset:#0{2 + max(2, reg.size_value // 4)}x}"
         periph = getattr(self, "_reg_periph", "")
         periph_txt = f"{periph}." if periph else ""
-        prov = getattr(reg.meta, "provenance", None)
+        prov = getattr(getattr(reg, "meta", None), "provenance", None)
         prov_txt = f"  ·  {prov.value}" if prov is not None and prov.value not in ("original",) else ""
         return (f"{periph_txt}{reg.name}   ·   {reg.size_value}-bit{addr_tail}"
                 f" ·  {len(reg.fields)} field(s){reset_txt}{prov_txt}")
 
-    def set_register(self, register: SvdRegister | None, address: int | None = None,
-                     peripheral: str = "", ):
+    def set_register(self, register: SvdRegister | CoreRegister | None, address: int | None = None,
+                     peripheral: str = ""):
         changed = register is not self.reg
         self.reg = register
-        self._reg_address = address if address is not None else getattr(self, "_reg_address", None)
-        self._reg_periph = peripheral if peripheral else getattr(self, "_reg_periph", "")
+        if changed or address is not None or peripheral:
+            self._reg_address = address
+            self._reg_periph = peripheral
+        self.legend.setProperty("coreRegister", isinstance(register, CoreRegister))
         self.canvas.set_register(register)
         self.title.setText(self._header_text())
         if changed:
@@ -346,7 +348,7 @@ class BitView(QWidget):
             self.legend.blockSignals(False)
             self._legend_loading = False
 
-    def _fill_legend(self, register: SvdRegister | None):
+    def _fill_legend(self, register: SvdRegister | CoreRegister | None):
         self.legend.setRowCount(0)
         if register is None:
             self.title.setText(t("bit_layout_title"))

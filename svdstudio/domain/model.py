@@ -176,6 +176,80 @@ class CpuInfo:
     nvic_prio_bits: int = 0
     vendor_systick_config: bool = False
     meta: NodeMeta = field(default_factory=NodeMeta)
+    fpu_dp: bool | None = None
+    dsp_present: bool | None = None
+    icache_present: bool | None = None
+    dcache_present: bool | None = None
+    itcm_present: bool | None = None
+    dtcm_present: bool | None = None
+    vtor_present: bool | None = None
+    device_num_interrupts: int | None = None
+    sau_num_regions: int | None = None
+    sau_regions_config_xml: bytes = b""
+
+
+# CMSIS-SVD 1.3 CPU sequence shared by the reader and writer.
+CPU_PROPERTIES = (
+    ("name", "name", str),
+    ("revision", "revision", str),
+    ("endian", "endian", str),
+    ("mpuPresent", "mpu_present", bool),
+    ("fpuPresent", "fpu_present", bool),
+    ("fpuDP", "fpu_dp", bool),
+    ("dspPresent", "dsp_present", bool),
+    ("icachePresent", "icache_present", bool),
+    ("dcachePresent", "dcache_present", bool),
+    ("itcmPresent", "itcm_present", bool),
+    ("dtcmPresent", "dtcm_present", bool),
+    ("vtorPresent", "vtor_present", bool),
+    ("nvicPrioBits", "nvic_prio_bits", int),
+    ("vendorSystickConfig", "vendor_systick_config", bool),
+    ("deviceNumInterrupts", "device_num_interrupts", int),
+    ("sauNumRegions", "sau_num_regions", int),
+)
+
+
+MAX_CORE_REGISTER_BITS = 4096
+
+
+@dataclass
+class CoreRegister:
+    """An architectural register selected by its debugger ID."""
+
+    name: str = ""
+    size: int = 32
+    description: str = ""
+    access: str = ""
+    reset_value: int | None = None
+    reset_mask: int | None = None
+    fields: list[SvdField] = field(default_factory=list)
+    meta: NodeMeta = field(default_factory=NodeMeta)
+
+    @property
+    def size_value(self) -> int:
+        return self.size
+
+    @property
+    def reset_value_value(self) -> int:
+        return self.reset_value if self.reset_value is not None else 0
+
+    @property
+    def reset_mask_value(self) -> int:
+        if self.reset_mask is not None:
+            return self.reset_mask
+        if 0 < self.size <= MAX_CORE_REGISTER_BITS:
+            return (1 << self.size) - 1
+        return 0
+
+
+@dataclass
+class CoreRegisterGroup:
+    """An ordered debugger profile with a group-wide architecture ID."""
+
+    name: str = ""
+    description: str = ""
+    registers: list[CoreRegister] = field(default_factory=list)
+    meta: NodeMeta = field(default_factory=NodeMeta)
 
 @dataclass
 class SvdDevice:
@@ -196,6 +270,13 @@ class SvdDevice:
     reset_mask: int = 0xFFFFFFFF
     peripherals: list[SvdPeripheral] = field(default_factory=list)
     meta: NodeMeta = field(default_factory=NodeMeta)
+    core_register_groups: list[CoreRegisterGroup] = field(default_factory=list)
+    header_system_filename: str = ""
+    header_definitions_prefix: str = ""
+    schema_version: str = "1.3"
+    xml_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
+    xml_attributes: dict[str, str] = field(default_factory=dict, repr=False)
+    vendor_extensions_xml: bytes = field(default=b"", repr=False)
 
 def iter_registers(p: SvdPeripheral):
     yield from p.registers

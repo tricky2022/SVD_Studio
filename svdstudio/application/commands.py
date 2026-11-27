@@ -7,20 +7,30 @@ from PySide6.QtGui import QUndoCommand
 
 
 class SetAttrCommand(QUndoCommand):
-    def __init__(self, obj, attr, new, refresh):
+    def __init__(self, obj, attr, new, refresh, *, present=None):
         super().__init__(f"Edit {attr}")
         self._object = obj
         self._attribute = attr
         self._new_value = new
         self._refresh = refresh
         self._old_value = getattr(obj, attr)
+        self._present = present
+        self._was_present = present is not None and present[0] in obj.meta.present
 
     def redo(self):
-        setattr(self._object, self._attribute, self._new_value)
-        self._refresh()
+        self._set(self._new_value, self._present is not None and self._present[1])
 
     def undo(self):
-        setattr(self._object, self._attribute, self._old_value)
+        self._set(self._old_value, self._was_present)
+
+    def _set(self, value, is_present):
+        setattr(self._object, self._attribute, value)
+        if self._present is not None:
+            tag, _ = self._present
+            if is_present:
+                self._object.meta.present.add(tag)
+            else:
+                self._object.meta.present.discard(tag)
         self._refresh()
 
 

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
+from svdstudio.domain.model import CPU_PROPERTIES, CpuInfo
 from svdstudio.ui.i18n import t
 
 # group -> ordered attrs per domain type (group titles are i18n keys)
@@ -16,6 +17,21 @@ GROUPS: dict[str, list[tuple[str, list[str]]]] = {
                         "license_text"]),
         ("g_addrwidth", ["address_unit_bits", "width", "size", "access", "protection",
                          "reset_value", "reset_mask"]),
+    ],
+    "CpuInfo": [
+        ("g_identity", ["name", "revision", "endian"]),
+        ("g_cpu_features", ["mpu_present", "fpu_present", "fpu_dp", "dsp_present",
+                            "icache_present", "dcache_present", "itcm_present", "dtcm_present",
+                            "vtor_present"]),
+        ("g_cpu_interrupts", ["nvic_prio_bits", "vendor_systick_config", "device_num_interrupts",
+                              "sau_num_regions"]),
+    ],
+    "CoreRegisterGroup": [("g_identity", ["name", "description"])],
+    "CoreRegister": [
+        ("g_identity", ["name", "description"]),
+        ("g_address", ["size"]),
+        ("g_access", ["access"]),
+        ("g_reset", ["reset_value", "reset_mask"]),
     ],
     "SvdPeripheral": [
         ("g_identity", ["name", "display_name", "description", "group_name", "header_struct_name",
@@ -47,7 +63,28 @@ CHOICES: dict[str, list[str]] = {
                               "zeroToSet", "zeroToToggle", "clear", "set", "modify"],
     "write_constraint": ["", "writeAsRead", "useEnumeratedValues", "range"],
     "endian": ["", "little", "big", "selectable", "other"],
+    "core_field_access": ["", "RW", "R", "W", "N"],
 }
+
+CPU_FLAGS = {"mpu_present", "fpu_present", "vendor_systick_config"}
+OPTIONAL_CPU_FLAGS = {"fpu_dp", "dsp_present", "icache_present", "dcache_present",
+                      "itcm_present", "dtcm_present", "vtor_present"}
+CPU_TAGS = {attr: tag for tag, attr, _ in CPU_PROPERTIES}
+CPU_INTS = {"nvic_prio_bits", "device_num_interrupts", "sau_num_regions"}
+OPTIONAL_INTS = {"size", "reset_value", "reset_mask"}
+HEX_INTS = {"reset_value", "reset_mask", "base_address", "address_offset"}
+CHOICES.update({name: ["", "true", "false"] for name in CPU_FLAGS | OPTIONAL_CPU_FLAGS})
+
+
+def _display(attr, value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and attr in HEX_INTS:
+        return f"{value:#x}"
+    return str(value)
+
 
 # category accent color per property group (module-level: immutable usage)
 CATEGORY_COLORS = {
@@ -72,6 +109,13 @@ LABEL_KEYS = {
     "vendor": "l_vendor", "vendor_id": "l_vendor_id", "series": "l_series",
     "version": "l_version", "license_text": "l_license_text",
     "address_unit_bits": "l_address_unit_bits", "width": "l_width",
+    "revision": "l_cpu_revision", "endian": "l_cpu_endian",
+    "mpu_present": "l_cpu_mpu", "fpu_present": "l_cpu_fpu", "fpu_dp": "l_cpu_fpu_dp",
+    "dsp_present": "l_cpu_dsp", "icache_present": "l_cpu_icache",
+    "dcache_present": "l_cpu_dcache", "itcm_present": "l_cpu_itcm", "dtcm_present": "l_cpu_dtcm",
+    "vtor_present": "l_cpu_vtor", "nvic_prio_bits": "l_cpu_nvic_prio_bits",
+    "vendor_systick_config": "l_cpu_systick", "device_num_interrupts": "l_cpu_interrupts",
+    "sau_num_regions": "l_cpu_sau_regions",
 }
 
 
@@ -95,6 +139,7 @@ class PropertyEditor(QTableWidget):
         header.setMinimumSectionSize(130)
         self.setColumnWidth(0, 175)
         self._obj = None
+        self._core_field = False
         self._loading = False
         self._row_attr: list[str | None] = []
         # closed-set attributes edit through a dropdown editor created on
@@ -107,14 +152,23 @@ class PropertyEditor(QTableWidget):
         """The domain object currently shown (None when the panel is empty)."""
         return self._obj
 
+    def _value(self, attr):
+        value = getattr(self._obj, attr)
+        if (isinstance(self._obj, CpuInfo) and attr in CPU_FLAGS | {"nvic_prio_bits"}
+                and CPU_TAGS[attr] not in self._obj.meta.present
+                and value == getattr(CpuInfo(), attr)):
+            return None
+        return value
+
     def refresh(self):
         """Re-render with current palette and language."""
         self.setHorizontalHeaderLabels([t("property"), t("value")])
-        self.set_object(self._obj)
+        self.set_object(self._obj, core_field=self._core_field)
 
-    def set_object(self, obj):
+    def set_object(self, obj, *, core_field=False):
         self._loading = True
         self._obj = obj
+        self._core_field = core_field
         # No persistent cell widgets are kept (dropdowns are delegate editors
         # created on demand), so clearing rows frees everything. Do NOT go
         # back to per-row QComboBox cell widgets: detached cell widgets are
@@ -136,7 +190,7 @@ class PropertyEditor(QTableWidget):
                     continue
                 self._add_section(group_name)
                 for attr in shown:
-                    self._add_row(attr, getattr(obj, attr), group_name)
+                    self._add_row(attr, self._value(attr), group_name)
         self.resizeRowsToContents()
         self._loading = False
 
@@ -176,18 +230,12 @@ class PropertyEditor(QTableWidget):
         accent = CATEGORY_COLORS.get(group)
         if accent is not None:
             name_item.setForeground(QColor(accent))
-        if isinstance(value, bool):
-            text = "true" if value else "false"
-        elif isinstance(value, int):
-            text = f"{value:#x}" if attr in ("reset_value", "reset_mask", "base_address",
-                                             "address_offset") else str(value)
-        else:
-            text = str(value)
+        text = _display(attr, value)
         self.setItem(row, 0, name_item)
-        choices = CHOICES.get(attr)
+        choice_key = "core_field_access" if self._core_field and attr == "access" else attr
         value_item = QTableWidgetItem(text)
-        value_item.setToolTip(f"{attr}: {text}" + (" (SVD 标准取值)" if choices else ""))
-        value_item.setData(Qt.ItemDataRole.UserRole, attr)
+        value_item.setToolTip(f"{attr}: {text}")
+        value_item.setData(Qt.ItemDataRole.UserRole, choice_key)
         self.setItem(row, 1, value_item)
         self._row_attr.append(attr)
 
@@ -200,24 +248,32 @@ class PropertyEditor(QTableWidget):
         attr = self._row_attr[row]
         cell = self.item(row, 1)
         text = cell.text().strip() if cell is not None else ""
-        old = getattr(self._obj, attr)
-        if isinstance(old, bool):
-            shown = "true" if old else "false"
-        elif isinstance(old, int) and attr in ("reset_value", "reset_mask", "base_address",
-                                               "address_offset"):
-            shown = f"{old:#x}"
-        else:
-            shown = str(old)
+        old = self._value(attr)
+        shown = _display(attr, old)
         if text == shown:
             return  # unchanged: never push a no-op undo step
         try:
-            if isinstance(old, bool):
-                new = text.lower() in ("1", "true", "yes", "真", "是")
-            elif isinstance(old, int):
-                new = int(text, 0)
+            if isinstance(old, bool) or attr in CPU_FLAGS | OPTIONAL_CPU_FLAGS:
+                new = {"true": True, "false": False}[text] if text else None
+            elif isinstance(old, int) or attr in OPTIONAL_INTS | CPU_INTS:
+                new = int(text, 0) if text else None
             else:
                 new = text
-        except (TypeError, ValueError):
-            cell.setText(shown)  # invalid input: restore instead of corrupting
+            if (new is None and attr not in CPU_FLAGS | OPTIONAL_CPU_FLAGS | CPU_INTS
+                    and not self._is_optional_int(attr)):
+                raise ValueError
+            if type(new) is int and (new < 0 or (attr == "size" and new < 1)):
+                raise ValueError
+        except (KeyError, ValueError):
+            self._loading = True
+            cell.setText(shown)
+            self._loading = False
             return
         self.valueEdited.emit(self._obj, attr, new)
+
+    def _is_optional_int(self, attr):
+        if attr not in OPTIONAL_INTS:
+            return False
+        return type(self._obj).__name__ not in {"SvdDevice"} and (
+            attr != "size" or type(self._obj).__name__ != "CoreRegister"
+        )

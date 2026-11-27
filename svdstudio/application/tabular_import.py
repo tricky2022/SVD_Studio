@@ -139,7 +139,8 @@ def import_rows(
     vendor: str = "",
 ) -> ImportResult:
     rows = list(rows)
-    result = ImportResult(device=SvdDevice(name=device_name, vendor=vendor))
+    result = ImportResult(device=SvdDevice(name=device_name, vendor=vendor,
+                                          version="1.0", description=device_name))
     if not rows:
         result.issues.append(ImportIssue("error", 0, "The table contains no data rows"))
         return result

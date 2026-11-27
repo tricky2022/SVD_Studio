@@ -1,16 +1,8 @@
-"""Unified entry point: GUI by default, CLI and MCP from the same binary.
-
-A single frozen executable serves all three interfaces, so shipping an
-``.exe`` to a colleague also ships the automation surface:
+"""SVD Studio desktop launcher.
 
     SVDStudio.exe                     # GUI
-    SVDStudio.exe --cli validate a.svd
-    SVDStudio.exe --cli import-table regs.csv out.svd --device MYDEV
-    SVDStudio.exe --mcp               # MCP stdio server for AI agents
-    SVDStudio.exe --version
-
-``svdstudio-cli.exe`` (console build) exposes the same flags without the
-Qt window subsystem, which is what MCP clients expect on stdout.
+    svdstudio-cli.exe validate a.svd   # console CLI
+    svdstudio-cli.exe --version
 """
 import sys
 
@@ -45,8 +37,8 @@ def main(argv=None):
         print(__doc__)
         return 0
     if argv and argv[0] == "--mcp":
-        from svdstudio.mcp_server import main as mcp_main
-        return mcp_main()
+        print("This build provides the command-line interface through svdstudio.", file=sys.stderr)
+        return 2
     if argv and argv[0] == "--cli":
         from svdstudio.cli import main as cli_main
         return cli_main(argv[1:])

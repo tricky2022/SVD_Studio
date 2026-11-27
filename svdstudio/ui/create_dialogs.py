@@ -8,7 +8,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QMessageBox,
+    QSpinBox,
 )
+
+from svdstudio.domain.model import MAX_CORE_REGISTER_BITS
+from svdstudio.ui.i18n import t
 
 
 def _non_empty(edit: QLineEdit, what: str) -> str:
@@ -104,8 +108,31 @@ class RegisterDialog(QDialog):
                 _parse_int(self.reset.text(), "复位值"), self.desc.text().strip())
 
 
+class CoreRegisterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(t("core_add_register"))
+        layout = QFormLayout(self)
+        self.name = QLineEdit()
+        self.size = QSpinBox()
+        self.size.setRange(1, MAX_CORE_REGISTER_BITS)
+        self.size.setValue(32)
+        self.desc = QLineEdit()
+        layout.addRow(t("name"), self.name)
+        layout.addRow(t("l_size"), self.size)
+        layout.addRow(t("description"), self.desc)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def parsed(self):
+        return _non_empty(self.name, t("core_register")), self.size.value(), self.desc.text().strip()
+
+
 class FieldDialog(QDialog):
-    def __init__(self, size: int = 32, parent=None):
+    def __init__(self, size: int = 32, parent=None, *, core=False):
         super().__init__(parent)
         self._size = size
         self.setWindowTitle("新建字段 / New Field")
@@ -114,7 +141,8 @@ class FieldDialog(QDialog):
         self.lsb = QLineEdit("0")
         self.width = QLineEdit("1")
         self.access = QComboBox()
-        self.access.addItems(["", "read-only", "write-only", "read-write"])
+        self.access.addItems(["", "RW", "R", "W", "N"] if core else
+                             ["", "read-only", "write-only", "read-write"])
         self.desc = QLineEdit("")
         layout.addRow("名称", self.name)
         layout.addRow("LSB", self.lsb)

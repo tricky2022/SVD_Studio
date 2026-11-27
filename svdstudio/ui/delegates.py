@@ -15,13 +15,17 @@ class AccessDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         combo = QComboBox(parent)
-        combo.addItems([self.EMPTY_LABEL if v == "" else v for v in self.VALUES])
+        values = ["", "RW", "R", "W", "N"] if self.parent().property("coreRegister") else self.VALUES
+        combo.addItems([self.EMPTY_LABEL if v == "" else v for v in values])
         return combo
 
     def setEditorData(self, editor, index):
         current = index.data() or ""
         label = self.EMPTY_LABEL if current == "" else current
         pos = editor.findText(label)
+        if pos < 0:
+            editor.addItem(label)
+            pos = editor.count() - 1
         editor.setCurrentIndex(max(pos, 0))
 
     def setModelData(self, editor, model, index):
@@ -59,6 +63,9 @@ class ChoiceDelegate(QStyledItemDelegate):
             return
         current = index.data() or ""
         pos = editor.findText(current)
+        if pos < 0:
+            editor.addItem(current)
+            pos = editor.count() - 1
         editor.setCurrentIndex(max(pos, 0))
 
     def setModelData(self, editor, model, index):

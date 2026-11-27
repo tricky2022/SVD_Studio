@@ -1,3 +1,0 @@
-[console_scripts]
-svdstudio = svdstudio.cli:main
-svdstudio-gui = svdstudio.app:main

@@ -3,14 +3,10 @@
 
 Two executables from one source tree:
 
-    Releases/SVDStudio.exe         windowed GUI; also answers --cli / --mcp
-    Releases/svdstudio-cli.exe     console binary for CLI and MCP clients
+    Releases/SVDStudio.exe         windowed GUI
+    Releases/svdstudio-cli.exe     console CLI
 
-The .ico is a build input and MUST exist: when the path is missing
-PyInstaller only warns and ships the generic icon, which is exactly how the
-packaged app previously lost its icon. Regenerate it with:
-
-    python tools/make_icon.py
+The checked-in .ico is a required build input.
 
 The Windows version resource is generated from svdstudio.__version__ so the
 file properties (Details tab) never drift from the About dialog.
@@ -24,10 +20,7 @@ from svdstudio import __author__, __license__, __version__  # noqa: E402
 
 ICON = str(Path(SPECPATH) / "resources" / "icons" / "svd-studio.ico")
 if not Path(ICON).exists():
-    raise SystemExit(
-        f"Missing build icon: {ICON}\nRun 'python tools/make_icon.py' first.")
-
-block_cipher = None
+    raise SystemExit(f"Missing build icon: {ICON}")
 
 DATAS = [
     ("resources/ui/*.ui", "resources/ui"),
@@ -99,21 +92,21 @@ def _analysis(script, excludes):
         excludes=excludes,
         win_no_prefer_redirects=False,
         win_private_assemblies=False,
-        cipher=block_cipher,
         noarchive=False,
     )
 
 
 # ---------------------------------------------------------------- GUI (windowed)
-a = _analysis("svdstudio/app.py", excludes=[])
+a = _analysis("svdstudio/app.py", excludes=[
+    "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtPdf",
+])
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name="SVDStudio",
@@ -133,16 +126,15 @@ exe = EXE(
     **VERSION_ARGS,
 )
 
-# ------------------------------------------------- CLI + MCP (console subsystem)
-a_cli = _analysis("run_cli.py", excludes=["PySide6", "tkinter", "unittest", "pydoc_data"])
+# ------------------------------------------------- CLI (console subsystem)
+a_cli = _analysis("svdstudio/cli.py", excludes=["PySide6", "tkinter", "unittest", "pydoc_data"])
 
-pyz_cli = PYZ(a_cli.pure, a_cli.zipped_data, cipher=block_cipher)
+pyz_cli = PYZ(a_cli.pure)
 
 exe_cli = EXE(
     pyz_cli,
     a_cli.scripts,
     a_cli.binaries,
-    a_cli.zipfiles,
     a_cli.datas,
     [],
     name="svdstudio-cli",

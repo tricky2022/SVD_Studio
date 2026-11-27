@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from svdstudio.domain.model import CPU_PROPERTIES, CpuInfo
+
 
 @dataclass
 class DiffEntry:
@@ -44,9 +46,52 @@ def _regmap(periph):
     return regs
 
 
+def _core_items(device):
+    for group in device.core_register_groups:
+        group_path = f"coreRegisters.{group.name}"
+        yield group_path, "core group", group, ("description",)
+        for register in group.registers:
+            register_path = f"{group_path}.{register.name}"
+            yield register_path, "core register", register, (
+                "description", "size", "access", "reset_value", "reset_mask")
+            for bit_field in register.fields:
+                yield f"{register_path}.{bit_field.name}", "core field", bit_field, (
+                    "description", "bit_offset", "bit_width", "access")
+
+
+def _diff_processor(report, a, b):
+    defaults = CpuInfo()
+    for tag, attr, _ in CPU_PROPERTIES:
+        default = getattr(defaults, attr)
+        old, new = getattr(a.cpu, attr), getattr(b.cpu, attr)
+        if tag not in a.cpu.meta.present and old == default:
+            old = None
+        if tag not in b.cpu.meta.present and new == default:
+            new = None
+        if old != new:
+            report.entries.append(DiffEntry("changed", "property", f"cpu.{tag}",
+                                            str(old), str(new)))
+
+    old_items = {path: (kind, obj, attrs) for path, kind, obj, attrs in _core_items(a)}
+    new_items = {path: (kind, obj, attrs) for path, kind, obj, attrs in _core_items(b)}
+    for path in sorted(old_items.keys() - new_items.keys()):
+        report.entries.append(DiffEntry("removed", old_items[path][0], path))
+    for path in sorted(new_items.keys() - old_items.keys()):
+        report.entries.append(DiffEntry("added", new_items[path][0], path))
+    for path in sorted(old_items.keys() & new_items.keys()):
+        _, old, attrs = old_items[path]
+        _, new, _ = new_items[path]
+        for attr in attrs:
+            before, after = getattr(old, attr), getattr(new, attr)
+            if before != after:
+                report.entries.append(DiffEntry("changed", "property", f"{path}.{attr}",
+                                                str(before), str(after)))
+
+
 def diff_devices(a, b) -> DiffReport:
     """Compare device A (old) vs B (new)."""
     rep = DiffReport()
+    _diff_processor(rep, a, b)
     am = {p.name: p for p in a.peripherals}
     bm = {p.name: p for p in b.peripherals}
     for name in sorted(set(am) - set(bm)):

@@ -33,7 +33,9 @@ def search(device: SvdDevice, query: str, limit: int = 100) -> list[SearchHit]:
     if addr is not None:
         return address_lookup(device, addr, limit=limit)
     parts = [p.strip().lower() for p in query.split(".") if p.strip()]
-    hits: list[SearchHit] = []
+    hits = list(_search_core_registers(device, query.lower(), limit))
+    if len(hits) >= limit:
+        return hits
     for p in device.peripherals:
         for r in list(p.registers) + [reg for c in p.clusters for reg in c.registers]:
             for f in r.fields:
@@ -55,6 +57,24 @@ def search(device: SvdDevice, query: str, limit: int = 100) -> list[SearchHit]:
         if query.lower() in p.name.lower() and len(hits) < limit:
             hits.append(SearchHit("peripheral", p.name, p.name, p.base_address))
     return hits[:limit]
+
+
+def _search_core_registers(device: SvdDevice, query: str, limit: int) -> list[SearchHit]:
+    hits: list[SearchHit] = []
+    for group in device.core_register_groups:
+        candidates = [("core group", group.name)]
+        for register in group.registers:
+            register_path = f"{group.name}.{register.name}"
+            candidates.append(("core register", register_path))
+            candidates.extend(("core field", f"{register_path}.{field.name}")
+                              for field in register.fields)
+        for kind, path in candidates:
+            full_path = f"coreRegisters.{path}"
+            if query in full_path.lower():
+                hits.append(SearchHit(kind, full_path, path))
+                if len(hits) >= limit:
+                    return hits
+    return hits
 
 
 def address_lookup(device: SvdDevice, address: int, limit: int = 20) -> list[SearchHit]:

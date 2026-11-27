@@ -8,6 +8,9 @@ import sys
 from svdstudio import __version__
 from svdstudio.application import project as P
 from svdstudio.application.tabular_import import import_file
+from svdstudio.domain.model import iter_registers
+from svdstudio.validators import Issue, Severity
+from svdstudio.validators.validate import core_register_issues
 
 
 def _print_import_result(result) -> None:
@@ -32,8 +35,6 @@ def _diagnose(path: str, schema: str = "", allow_discovery: bool = True) -> tupl
     try:
         _state, issues = P.open_svd(path)
     except (OSError, ValueError) as error:
-        from svdstudio.validators import Severity
-        from svdstudio.validators.validate import Issue
         return [Issue("XML-001", Severity.ERROR, path,
                       f"{type(error).__name__}: {error}")], []
 
@@ -41,10 +42,11 @@ def _diagnose(path: str, schema: str = "", allow_discovery: bool = True) -> tupl
     if allow_discovery:
         try:
             resolved = X.discover_schema(path, schema)
-        except X.SchemaUnavailable:
-            resolved = ""
-        if resolved:
-            schema_issues = X.validate_xsd(path, resolved)
+        except X.SchemaUnavailable as error:
+            schema_issues = [Issue("XSD-001", Severity.ERROR, schema, str(error), source=schema)]
+        else:
+            if resolved:
+                schema_issues = X.validate_xsd(path, resolved)
     return issues, schema_issues
 
 
@@ -58,6 +60,42 @@ def _print_issues(issues) -> None:
 
 def _exit_code(issues) -> int:
     return 1 if any(getattr(i.severity, "value", i.severity) == "error" for i in issues) else 0
+
+
+def _tmk_core(args) -> int:
+    from svdstudio.infrastructure import tmk_registers as tmk
+
+    try:
+        state, _ = P.open_svd(args.svd)
+        groups = state.device.core_register_groups
+        if args.cmd == "export-tmk-core":
+            matches = [group for group in groups if group.name == args.group]
+            if len(matches) != 1:
+                raise ValueError(f"Expected one core register group with ID {args.group!r}")
+            tmk.save_tmk_register_profile(matches[0], args.output)
+        else:
+            incoming = (tmk.load_tmk_register_profiles_from_jar(args.jar) if args.jar else
+                        [tmk.load_tmk_register_profile(path) for path in args.xml])
+            known = {group.name: index for index, group in enumerate(groups)}
+            for group in incoming:
+                if group.name in known:
+                    if not args.replace:
+                        raise ValueError(f"Group {group.name!r} already exists. Use --replace to update it.")
+                    groups[known[group.name]] = group
+                else:
+                    known[group.name] = len(groups)
+                    groups.append(group)
+            issues = core_register_issues(state.device)
+            if issues:
+                for issue in issues:
+                    print(issue.to_line(), file=sys.stderr)
+                return 1
+            P.save_svd(state, args.output)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"written={args.output}")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -94,7 +132,23 @@ def main(argv=None) -> int:
     table.add_argument("--sheet", default="", help="XLSX worksheet name")
     table.add_argument("--dry-run", action="store_true", help="Validate and preview without writing")
 
+    core = sub.add_parser("import-tmk-core", help="Import TMK CPU/FPU profiles into an SVD")
+    core.add_argument("svd", help="Input SVD")
+    core.add_argument("output", help="Output SVD")
+    profiles = core.add_mutually_exclusive_group(required=True)
+    profiles.add_argument("--xml", nargs="+", help="One or more TMK CPU/FPU profile XML files")
+    profiles.add_argument("--jar", help="TMKStudioIDE debug core plugin JAR")
+    core.add_argument("--replace", action="store_true", help="Replace an existing group by its ID")
+
+    export = sub.add_parser("export-tmk-core", help="Export one SVD group as TMK profile XML")
+    export.add_argument("svd")
+    export.add_argument("group", help="Core register group ID")
+    export.add_argument("output", help="Output TMK profile XML")
+
     args = parser.parse_args(argv)
+
+    if args.cmd in ("import-tmk-core", "export-tmk-core"):
+        return _tmk_core(args)
 
     if args.cmd in ("validate", "doctor"):
         allow_discovery = not getattr(args, "no_schema", False)
@@ -118,15 +172,27 @@ def main(argv=None) -> int:
             print(f"error: {type(error).__name__}: {error}", file=sys.stderr)
             return 1
         device = state.device
+        registers = [register for peripheral in device.peripherals
+                     for register in iter_registers(peripheral)]
+        fields = sum(len(register.fields) for register in registers)
         if args.json:
-            from svdstudio import api
-            print(json.dumps(api.summary(api.Session(path=args.svd, device=device)),
-                             indent=2, ensure_ascii=False))
+            summary = {
+                "path": args.svd,
+                "device": device.name,
+                "vendor": device.vendor,
+                "peripherals": len(device.peripherals),
+                "registers": len(registers),
+                "fields": fields,
+                "core_register_groups": [
+                    {"id": group.name, "registers": len(group.registers),
+                     "fields": sum(len(register.fields) for register in group.registers)}
+                    for group in device.core_register_groups
+                ],
+            }
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
             return 0
-        registers = sum(len(p.registers) for p in device.peripherals)
-        fields = sum(len(r.fields) for p in device.peripherals for r in p.registers)
         print(f"device={device.name} vendor={device.vendor} "
-              f"peripherals={len(device.peripherals)} registers={registers} fields={fields}")
+              f"peripherals={len(device.peripherals)} registers={len(registers)} fields={fields}")
         return 0
 
     if args.cmd == "import-table":

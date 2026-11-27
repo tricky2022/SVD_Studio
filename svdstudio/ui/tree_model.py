@@ -4,12 +4,18 @@ from __future__ import annotations
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 
 from svdstudio.domain.model import (
+    CoreRegister,
+    CoreRegisterGroup,
+    CpuInfo,
     EnumeratedValues,
     SvdCluster,
     SvdDevice,
     SvdPeripheral,
     SvdRegister,
 )
+from svdstudio.ui.i18n import t
+
+CORE_REGISTERS = "Core Registers"
 
 # muted flat icon tones: dusty pastels, no neon, consistent across themes
 FLAT_TONES = {
@@ -52,6 +58,7 @@ class DeviceTreeModel(QAbstractItemModel):
     def __init__(self, dev: SvdDevice | None = None):
         super().__init__()
         self.root = _Node("root")
+        self._by_object: dict[int, _Node] = {}
         self._dev = None
         if dev:
             self.set_device(dev)
@@ -60,12 +67,16 @@ class DeviceTreeModel(QAbstractItemModel):
         self.beginResetModel()
         self.root = _Node("root")
         self._dev = dev
-        self._by_object: dict[int, _Node] = {}
+        self._by_object.clear()
         device_node = _Node(dev.name or "Device", dev, self.root)
         self.root.children.append(device_node)
-        device_node.children.append(_Node("CPU", dev.cpu, device_node))
-        peripherals_node = _Node("Peripherals", None, device_node)
-        device_node.children.append(peripherals_node)
+        device_node.add(self._register(_Node("CPU", dev.cpu, device_node)))
+        peripherals_node = device_node.add(_Node("Peripherals", None, device_node))
+        core_node = device_node.add(_Node(CORE_REGISTERS, None, device_node))
+        for group in dev.core_register_groups:
+            group_node = core_node.add(self._register(_Node(group.name, group, core_node)))
+            for register in group.registers:
+                self._add_register(register, group_node)
         self._register(device_node)
         for peripheral in dev.peripherals:
             self._add_peripheral(peripheral, peripherals_node)
@@ -85,6 +96,9 @@ class DeviceTreeModel(QAbstractItemModel):
     def source_index_for(self, obj) -> QModelIndex:
         """QModelIndex of a domain object without walking the whole tree."""
         node = self.node_for(obj)
+        return self.source_index_for_node(node)
+
+    def source_index_for_node(self, node: _Node | None) -> QModelIndex:
         if node is None or node.parent is None:
             return QModelIndex()
         chain, cursor = [], node
@@ -113,7 +127,7 @@ class DeviceTreeModel(QAbstractItemModel):
         for nested in cluster.clusters:
             self._add_cluster(nested, cluster_node)
 
-    def _add_register(self, register: SvdRegister, parent: _Node):
+    def _add_register(self, register: SvdRegister | CoreRegister, parent: _Node):
         register_node = self._register(_Node(register.name, register, parent))
         parent.children.append(register_node)
         for field in register.fields:
@@ -121,8 +135,9 @@ class DeviceTreeModel(QAbstractItemModel):
             register_node.children.append(field_node)
             for enum_values in field.enumerated_values:
                 self._add_enumerations(enum_values, field_node)
-        for enum_values in register.enumerated_values:
-            self._add_enumerations(enum_values, register_node)
+        if isinstance(register, SvdRegister):
+            for enum_values in register.enumerated_values:
+                self._add_enumerations(enum_values, register_node)
 
     def _add_enumerations(self, enum_values: EnumeratedValues, parent: _Node):
         enum_node = self._register(
@@ -161,7 +176,7 @@ class DeviceTreeModel(QAbstractItemModel):
         if not index.isValid():
             return base
         node: _Node = index.internalPointer()
-        if node.obj is not None and hasattr(node.obj, "name"):
+        if node.obj is not None and hasattr(node.obj, "name") and not isinstance(node.obj, CpuInfo):
             return base | Qt.ItemFlag.ItemIsEditable
         return base
 
@@ -169,7 +184,7 @@ class DeviceTreeModel(QAbstractItemModel):
         if role != Qt.ItemDataRole.EditRole or not index.isValid():
             return False
         node: _Node = index.internalPointer()
-        if node.obj is None or not hasattr(node.obj, "name"):
+        if node.obj is None or not hasattr(node.obj, "name") or isinstance(node.obj, CpuInfo):
             return False
         text = str(value).strip()
         if not text or text == getattr(node.obj, "name", ""):
@@ -182,6 +197,10 @@ class DeviceTreeModel(QAbstractItemModel):
             return None
         node: _Node = index.internalPointer()
         if role == Qt.ItemDataRole.DisplayRole:
+            if node.label == "CPU" and isinstance(node.obj, CpuInfo):
+                return t("cpu_metadata")
+            if node.obj is None and node.label == CORE_REGISTERS:
+                return t("core_registers")
             # live name: property renames reflect instantly without a model reset
             return getattr(node.obj, "name", None) or node.label
         if role == Qt.ItemDataRole.DecorationRole:
@@ -194,7 +213,7 @@ class DeviceTreeModel(QAbstractItemModel):
                 return icon("peripheral", FLAT_TONES["peripheral"])
             if isinstance(o, SvdCluster):
                 return icon("cluster", FLAT_TONES["cluster"])
-            if isinstance(o, SvdRegister):
+            if isinstance(o, (SvdRegister, CoreRegister)):
                 return icon("register", FLAT_TONES["register"])
             if isinstance(o, SvdField):
                 return icon("field", FLAT_TONES["field"])
@@ -202,7 +221,7 @@ class DeviceTreeModel(QAbstractItemModel):
                 return icon("enum", FLAT_TONES["enum"])
             if o is None and node.label == "Peripherals":
                 return icon("peripherals", FLAT_TONES["peripherals"])
-            if node.label == "CPU":
+            if isinstance(o, (CpuInfo, CoreRegisterGroup)) or (o is None and node.label == CORE_REGISTERS):
                 return icon("cpu", FLAT_TONES["cpu"])
             return icon("enum_value", FLAT_TONES["enum_value"])
         if role == Qt.ItemDataRole.ForegroundRole:

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from svdstudio.domain.model import SvdDevice
+from svdstudio.domain.model import MAX_CORE_REGISTER_BITS, SvdDevice
 from svdstudio.infrastructure import svd_parser
 
 
@@ -138,4 +138,46 @@ def semantic_check(dev: SvdDevice) -> list[Issue]:
                             add("SVD-ENUM-001", Severity.WARNING, f"{fp}.{v.name}",
                                 f"Enum value {v.value:#x} does not fit field width "
                                 f"{f.bit_width}", f)
+    issues.extend(core_register_issues(dev))
+    return issues
+
+
+def core_register_issues(dev: SvdDevice) -> list[Issue]:
+    """Validate register IDs and field geometry independently of memory addresses."""
+    issues: list[Issue] = []
+    source = dev.meta.source_file or ""
+
+    def add(rule: str, path: str, message: str, obj) -> None:
+        issues.append(Issue(rule, Severity.ERROR, path, message,
+                            line=_line_of(obj), source=source))
+
+    def check_name(name: str, seen: set[str], path: str, obj) -> None:
+        if not name.strip():
+            add("SVD-CORE-001", path, "Core register group, register and field IDs are required", obj)
+        elif name in seen:
+            add("SVD-CORE-002", path, f"Duplicate ID {name!r} in this group or register", obj)
+        seen.add(name)
+
+    groups: set[str] = set()
+    for group in dev.core_register_groups:
+        group_path = f"{dev.name}.coreRegisters.{group.name}"
+        check_name(group.name, groups, group_path, group)
+        registers: set[str] = set()
+        for reg in group.registers:
+            reg_path = f"{group_path}.{reg.name}"
+            check_name(reg.name, registers, reg_path, reg)
+            if not 1 <= reg.size <= MAX_CORE_REGISTER_BITS:
+                add("SVD-CORE-003", reg_path,
+                    f"Register size must be between 1 and {MAX_CORE_REGISTER_BITS} bits", reg)
+                continue
+            for value in (reg.reset_value, reg.reset_mask):
+                if value is not None and not 0 <= value < 1 << reg.size:
+                    add("SVD-CORE-004", reg_path, "Reset value or mask exceeds register size", reg)
+            fields: set[str] = set()
+            for field in reg.fields:
+                field_path = f"{reg_path}.{field.name}"
+                check_name(field.name, fields, field_path, field)
+                if (field.bit_offset < 0 or field.bit_width < 1
+                        or field.bit_offset + field.bit_width > reg.size):
+                    add("SVD-CORE-005", field_path, "Field exceeds the register bit range", field)
     return issues

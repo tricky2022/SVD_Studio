@@ -20,6 +20,7 @@ SVD Studio is a desktop CMSIS-SVD workbench for embedded engineers. It combines 
 - Inspect bit layouts; double-click an unused bit to create a field.
 - Edit properties with grouped sections and SVD-standard value choices.
 - Create devices, peripherals, clusters, registers and fields with undo/redo.
+- Edit CMSIS CPU metadata and debugger core register groups, and import or export TMKStudioIDE CPU/FPU profiles.
 - Validate XML and semantic rules with Problems navigation.
 - Compare two devices with a tree diff.
 - Apply and migrate YAML overlays for vendor updates.
@@ -69,7 +70,7 @@ The repository includes the icon assets and a PyInstaller specification:
 .\build-exe.bat
 ```
 
-The executable is written to `Releases/SVDStudio.exe`. Build output and temporary PyInstaller directories are ignored by Git.
+The build writes `Releases/SVDStudio.exe` and `Releases/svdstudio-cli.exe`. Build output and temporary PyInstaller directories are ignored by Git.
 
 ## Architecture
 
@@ -96,6 +97,7 @@ The domain layer deliberately has no Qt or lxml imports. UI code never manipulat
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [统一维护 CPU、FPU 和外设寄存器](docs/tmk-core-registers.md)
 - [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

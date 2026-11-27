@@ -2,10 +2,53 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 
 from lxml import etree
 
-from svdstudio.domain.model import *
+from svdstudio.domain.model import (
+    CPU_PROPERTIES,
+    MAX_CORE_REGISTER_BITS,
+    AddressBlock,
+    CoreRegister,
+    CoreRegisterGroup,
+    CpuInfo,
+    DimInfo,
+    EnumeratedValues,
+    EnumValue,
+    SvdCluster,
+    SvdDevice,
+    SvdField,
+    SvdInterrupt,
+    SvdPeripheral,
+    SvdRegister,
+)
+
+CORE_REGISTERS_NS = "https://github.com/tricky2022/SVD_Studio/core-registers/v1"
+CORE_REGISTERS_TAG = f"{{{CORE_REGISTERS_NS}}}coreRegisters"
+
+_CORE_CHILDREN = {
+    "coreRegisters": {"group"},
+    "group": {"register"},
+    "register": {"fields"},
+    "fields": {"field"},
+    "field": {
+        "name", "description", "bitOffset", "bitWidth", "lsb", "msb", "bitRange", "access",
+        "resetValue", "modifiedWriteValues", "writeConstraint", "readAction", "enumeratedValues",
+        "dim", "dimIncrement", "dimIndex",
+    },
+    "writeConstraint": {"writeAsRead", "useEnumeratedValues", "range"},
+    "range": {"minimum", "maximum"},
+    "enumeratedValues": {"name", "headerEnumName", "usage", "enumeratedValue"},
+    "enumeratedValue": {"name", "description", "value", "isDefault"},
+}
+_CORE_REPEATABLE = {"group", "register", "field", "enumeratedValues", "enumeratedValue"}
+_CORE_ATTRIBUTES = {
+    "group": {"name", "description"},
+    "register": {"name", "description", "size", "access", "resetValue", "resetMask"},
+    "field": {"derivedFrom"},
+    "enumeratedValues": {"derivedFrom"},
+}
 
 
 def _t(node, tag, default=""):
@@ -214,16 +257,117 @@ def _mark(element, obj, *attrs: str) -> None:
             meta.present.add(tag)
 
 
-def _count(root, tags: tuple[str, ...]) -> int:
-    return sum(1 for element in root.iter() if element.tag in tags)
+def _strip_namespace(root, namespace: str | None) -> None:
+    if namespace:
+        prefix = f"{{{namespace}}}"
+        for element in root.iter():
+            if isinstance(element.tag, str) and element.tag.startswith(prefix):
+                element.tag = element.tag[len(prefix):]
 
 
-def _strip_namespaces(tree) -> None:
-    """Vendor files sometimes declare a default xmlns; plain tag lookup
-    would then silently find nothing and yield an empty device."""
-    for element in tree.iter():
-        if isinstance(element.tag, str) and "}" in element.tag:
-            element.tag = element.tag.rsplit("}", 1)[1]
+def _embedded_xml(element) -> bytes:
+    # The output has no source DTD, so retaining unresolved references would
+    # produce a fragment that cannot be parsed again.
+    for entity in element.iter(etree.Entity):
+        raise ValueError(f"Unsupported XML entity &{entity.name}; at line {entity.sourceline}")
+    return etree.tostring(element, encoding="utf-8", with_tail=False)
+
+
+def _parse_cpu(element) -> CpuInfo:
+    cpu = CpuInfo()
+    for tag, attribute, kind in CPU_PROPERTIES:
+        if element.find(tag) is None:
+            continue
+        if kind is bool:
+            value = _t(element, tag).lower() in {"true", "1"}
+        elif kind is int:
+            value = _i(element, tag)
+        else:
+            value = _t(element, tag)
+        setattr(cpu, attribute, value)
+        cpu.meta.present.add(tag)
+    sau_config = element.find("sauRegionsConfig")
+    if sau_config is not None:
+        normalized = deepcopy(sau_config)
+        etree.cleanup_namespaces(normalized)
+        cpu.sau_regions_config_xml = _embedded_xml(normalized)
+    _mark_line(element, cpu)
+    return cpu
+
+
+def _core_integer(element, attr: str, *, required: bool = False) -> int | None:
+    text = element.get(attr)
+    if text is None and not required:
+        return None
+    try:
+        return int(text, 10) if text and text.isdecimal() else int(text, 0)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid core register {attr} at line {element.sourceline}") from error
+
+
+def _parse_core_register(element) -> CoreRegister:
+    size = _core_integer(element, "size", required=True)
+    if size is None or not 1 <= size <= MAX_CORE_REGISTER_BITS:
+        raise ValueError(f"Core register size must be 1–{MAX_CORE_REGISTER_BITS} bits "
+                         f"at line {element.sourceline}")
+    register = CoreRegister(
+        name=element.get("name", ""),
+        description=element.get("description", ""),
+        access=element.get("access", ""),
+        size=size,
+        reset_value=_core_integer(element, "resetValue"),
+        reset_mask=_core_integer(element, "resetMask"),
+        fields=[_parse_field(item) for item in element.findall("fields/field")],
+    )
+    _mark_line(element, register)
+    return register
+
+
+def _check_core_structure(element) -> None:
+    name = etree.QName(element).localname
+    unknown = set(element.attrib) - _CORE_ATTRIBUTES.get(name, set())
+    if unknown:
+        raise ValueError(f"Unsupported core {name} attributes {', '.join(sorted(unknown))} "
+                         f"at line {element.sourceline}")
+    if name in _CORE_CHILDREN and name != "writeConstraint" and (element.text or "").strip():
+        raise ValueError(f"Unexpected text in core {name} at line {element.sourceline}")
+    allowed = _CORE_CHILDREN.get(name, set())
+    seen = set()
+    for child in element:
+        if child.tag is etree.Comment and not (child.tail or "").strip():
+            continue
+        try:
+            tag = etree.QName(child)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Unsupported XML node in core {name} at line {child.sourceline}") from error
+        if tag.namespace != CORE_REGISTERS_NS or tag.localname not in allowed:
+            raise ValueError(f"Unsupported element {child.tag} in core {name} at line {child.sourceline}")
+        if tag.localname in seen and tag.localname not in _CORE_REPEATABLE:
+            raise ValueError(f"Duplicate core {tag.localname} at line {child.sourceline}")
+        if (child.tail or "").strip():
+            raise ValueError(f"Unexpected text in core {name} at line {child.sourceline}")
+        seen.add(tag.localname)
+        _check_core_structure(child)
+
+
+def _parse_vendor_extensions(element, device: SvdDevice) -> None:
+    core = element.find(CORE_REGISTERS_TAG)
+    if core is not None:
+        element.remove(core)
+        if element.find(CORE_REGISTERS_TAG) is not None:
+            raise ValueError("SVD contains multiple SVD Studio coreRegisters extensions")
+        _check_core_structure(core)
+        _strip_namespace(core, CORE_REGISTERS_NS)
+        for item in core.findall("group"):
+            group = CoreRegisterGroup(
+                name=item.get("name", ""),
+                description=item.get("description", ""),
+                registers=[_parse_core_register(register) for register in item.findall("register")],
+            )
+            _mark_line(item, group)
+            device.core_register_groups.append(group)
+    if core is None or len(element) or element.attrib or (element.text or "").strip():
+        device.vendor_extensions_xml = _embedded_xml(element)
 
 
 def parse_file(path: str) -> SvdDevice:
@@ -239,41 +383,60 @@ def parse_file(path: str) -> SvdDevice:
             f"File is {size / 1024 / 1024:.1f} MB, over the "
             f"{MAX_FILE_BYTES / 1024 / 1024:.0f} MB safety limit; "
             "split it or use the CLI to inspect it in parts")
-    parser = etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False,
-                             remove_comments=True)
+    parser = etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False)
     try:
         tree = etree.parse(path, parser)
     except etree.XMLSyntaxError as error:
         raise ValueError(f"XML is not well-formed: {error}") from error
     except (OSError, ValueError) as error:
         raise ValueError(f"Cannot read file: {error}") from error
-    _strip_namespaces(tree)
     root = tree.getroot()
-    if root.tag != "device":
+    root_name = etree.QName(root)
+    if root_name.localname != "device":
         raise ValueError(f"Root element is <{root.tag}>, expected <device>; not an SVD file")
+    vendor_tag = f"{{{root_name.namespace}}}vendorExtensions" if root_name.namespace else "vendorExtensions"
+    vendor = root.find(vendor_tag)
+    if vendor is not None:
+        root.remove(vendor)
+    _strip_namespace(root, root_name.namespace)
+    core = vendor.find(CORE_REGISTERS_TAG) if vendor is not None else None
     registers = sum(1 for _ in root.iter("register"))
+    fields = sum(1 for _ in root.iter("field"))
+    if core is not None:
+        registers += sum(1 for _ in core.iter(f"{{{CORE_REGISTERS_NS}}}register"))
+        fields += sum(1 for _ in core.iter(f"{{{CORE_REGISTERS_NS}}}field"))
     if registers > MAX_REGISTERS:
         raise ValueError(f"File declares {registers} registers, over the {MAX_REGISTERS} "
                          "safety limit; use the CLI to inspect it in parts")
-    fields = sum(1 for _ in root.iter("field"))
     if fields > MAX_FIELDS:
         raise ValueError(f"File declares {fields} fields, over the {MAX_FIELDS} "
                          "safety limit; use the CLI to inspect it in parts")
-    dev = SvdDevice(name=_t(root, "name"), version=_t(root, "version"),
-                    description=_t(root, "description"), vendor=_t(root, "vendor"),
-                    vendor_id=_t(root, "vendorID"), series=_t(root, "series"))
-    dev.address_unit_bits = _i(root, "addressUnitBits", 8)
-    dev.width = _i(root, "width", 32); dev.size = _i(root, "size", 32)
-    dev.access = _t(root, "access"); dev.reset_value = _i(root, "resetValue", 0)
+    dev = SvdDevice(
+        name=_t(root, "name"),
+        version=_t(root, "version"),
+        description=_t(root, "description"),
+        vendor=_t(root, "vendor"),
+        vendor_id=_t(root, "vendorID"),
+        series=_t(root, "series"),
+        license_text=_t(root, "licenseText"),
+        header_system_filename=_t(root, "headerSystemFilename"),
+        header_definitions_prefix=_t(root, "headerDefinitionsPrefix"),
+        address_unit_bits=_i(root, "addressUnitBits", 8),
+        width=_i(root, "width", 32),
+        size=_i(root, "size", 32),
+        access=_t(root, "access"),
+        protection=_t(root, "protection"),
+        reset_value=_i(root, "resetValue", 0),
+        reset_mask=_i(root, "resetMask", 0xFFFFFFFF),
+        schema_version=root.get("schemaVersion", "1.3"),
+        xml_namespaces={prefix: uri for prefix, uri in root.nsmap.items() if prefix is not None},
+        xml_attributes={name: value for name, value in root.attrib.items() if name != "schemaVersion"},
+    )
     cpu_el = root.find("cpu")
     if cpu_el is not None:
-        dev.cpu = CpuInfo(name=_t(cpu_el, "name"), revision=_t(cpu_el, "revision"), endian=_t(cpu_el, "endian"),
-                          mpu_present=_t(cpu_el, "mpuPresent") == "true", fpu_present=_t(cpu_el, "fpuPresent") == "true",
-                          nvic_prio_bits=_i(cpu_el, "nvicPrioBits"),
-                          vendor_systick_config=_t(cpu_el, "vendorSystickConfig") == "true")
-        _mark_line(cpu_el, dev.cpu)
-        _mark(cpu_el, dev.cpu, "name", "revision", "endian", "mpuPresent",
-              "fpuPresent", "nvicPrioBits", "vendorSystickConfig")
+        dev.cpu = _parse_cpu(cpu_el)
+    if vendor is not None:
+        _parse_vendor_extensions(vendor, dev)
     _mark(root, dev, "vendor", "vendorID", "name", "series", "version", "description",
           "licenseText", "addressUnitBits", "width", "size", "access", "protection",
           "resetValue", "resetMask", "cpu")

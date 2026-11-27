@@ -1,6 +1,7 @@
 # Releases
 
-`build-exe.bat` builds a one-file Windows executable with the application icon:
+`build-exe.bat` builds the desktop and command-line programs. Run it from a
+checkout with the `.venv` described in the project README.
 
 ```bat
 build-exe.bat
@@ -10,8 +11,8 @@ Output:
 
 ```text
 Releases/SVDStudio.exe
+Releases/svdstudio-cli.exe
 ```
 
-Requirements are installed automatically (`pyinstaller`, `pillow`).
-The bundle includes Qt UI files, QSS themes and icons, and hides the console
-(`console=False`) so the app runs as a normal desktop program.
+The build uses the checked-in application icon and includes the Qt UI files
+and themes. Run `Releases\svdstudio-cli.exe --help` for command-line commands.

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QIODevice, QSettings, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QFile, QIODevice, QModelIndex, QSettings, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QAction, QColor, QKeySequence, QUndoStack
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -25,18 +25,29 @@ from PySide6.QtWidgets import (
 
 from svdstudio.application import commands as C
 from svdstudio.application import project as P
-from svdstudio.domain.model import SvdDevice, SvdField, SvdPeripheral, SvdRegister
+from svdstudio.domain.model import (
+    MAX_CORE_REGISTER_BITS,
+    CoreRegister,
+    CoreRegisterGroup,
+    CpuInfo,
+    SvdCluster,
+    SvdDevice,
+    SvdField,
+    SvdPeripheral,
+    SvdRegister,
+)
 from svdstudio.resources import resource_path
 from svdstudio.ui.app_icon import make_app_icon
 from svdstudio.ui.bitview import BitView
 from svdstudio.ui.i18n import current_language, set_language, t
 from svdstudio.ui.icons import icon as app_icon
-from svdstudio.ui.properties import PropertyEditor
+from svdstudio.ui.properties import CPU_TAGS, PropertyEditor
 from svdstudio.ui.theme import apply_theme, current_mode
-from svdstudio.ui.tree_model import DeviceTreeModel
+from svdstudio.ui.tree_model import CORE_REGISTERS, DeviceTreeModel
 from svdstudio.validators import validate as V
 
 UI_FILE = resource_path("resources", "ui", "main_window.ui")
+REGISTER_TYPES = (SvdRegister, CoreRegister)
 
 
 class MainWindow(QMainWindow):
@@ -53,7 +64,7 @@ class MainWindow(QMainWindow):
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.proxy.setRecursiveFilteringEnabled(True)
         self.device_tree.setModel(self.proxy)
-        self.device_tree.clicked.connect(self._select)
+        self.device_tree.selectionModel().currentChanged.connect(self._select)
         self.device_tree.doubleClicked.connect(self._rename_at)
         self.model.renameCommitted.connect(self._rename_from_tree)
         self.device_tree.setIconSize(self.device_tree.iconSize() * 0.9)
@@ -81,21 +92,11 @@ class MainWindow(QMainWindow):
             self.switch_language(saved_language)
 
     def closeEvent(self, event):
-        if self.state.dirty:
-            answer = QMessageBox.question(
-                self, "未保存的修改", "当前设备有未保存的修改，是否保存？",
-                QMessageBox.StandardButton.Save
-                | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel,
-            )
-            if answer == QMessageBox.StandardButton.Cancel:
-                event.ignore()
-                return
-            if answer == QMessageBox.StandardButton.Save:
-                self.save()
-                if self.state.dirty:
-                    event.ignore()
-                    return
+        if not self._confirm_replace_device():
+            event.ignore()
+            return
+        from svdstudio.ui.load_worker import wait_for_file_jobs
+        wait_for_file_jobs(self)
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.setValue("mainSplitter", self.main_splitter.saveState())
         self._settings.setValue("theme", current_mode())
@@ -295,7 +296,6 @@ class MainWindow(QMainWindow):
         # VS-style tree: context menu + keyboard instead of button bar
         self.device_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.device_tree.customContextMenuRequested.connect(self._tree_menu)
-        self.device_tree.doubleClicked.connect(self._rename_at)
         self.device_tree.expanded.connect(self._on_tree_expanded)
         self.device_tree.collapsed.connect(self._on_tree_collapsed)
         self._setup_command_palette()
@@ -313,12 +313,12 @@ class MainWindow(QMainWindow):
     def _track_expansion(self, proxy_index, expanded: bool):
         """Remember which objects are expanded so a rebuild can restore them."""
         if not hasattr(self, "_expanded_ids"):
-            self._expanded_ids: set[int] = set()
+            self._expanded_ids: set[int | str] = set()
         source = self.proxy.mapToSource(proxy_index)
         node = source.internalPointer() if source.isValid() else None
         if node is None:
             return
-        key = id(node.obj if node.obj is not None else node)
+        key = id(node.obj) if node.obj is not None else node.label
         if expanded:
             self._expanded_ids.add(key)
         else:
@@ -348,8 +348,11 @@ class MainWindow(QMainWindow):
             return
         parts = []
         cursor = node
-        while cursor is not None and cursor.obj is not None:
-            parts.append(getattr(cursor.obj, "name", type(cursor.obj).__name__))
+        while cursor is not None and cursor.parent is not None:
+            label = t("core_registers") if cursor.label == CORE_REGISTERS else cursor.label
+            if isinstance(cursor.obj, CpuInfo):
+                label = t("cpu_metadata")
+            parts.append(getattr(cursor.obj, "name", "") or label)
             cursor = cursor.parent
         self.statusBar().showMessage("  /  ".join(reversed([p for p in parts if p])))
 
@@ -406,7 +409,7 @@ class MainWindow(QMainWindow):
             return
         source = self.proxy.mapToSource(index)
         node = source.internalPointer() if source.isValid() else None
-        if node is None or node.obj is None or not hasattr(node.obj, "name"):
+        if node is None or not (self.model.flags(source) & Qt.ItemFlag.ItemIsEditable):
             return
         self.device_tree.edit(index)
 
@@ -420,7 +423,7 @@ class MainWindow(QMainWindow):
         """Validate a tree rename and route it through the undo stack."""
         if not new or new == getattr(obj, "name", ""):
             return
-        if self._sibling_names(obj) is not None and new in self._sibling_names(obj):
+        if new in self._sibling_names(obj):
             self.statusBar().showMessage(t("rename_dup"), 4000)
             return
         old = getattr(obj, "name", "")
@@ -430,20 +433,11 @@ class MainWindow(QMainWindow):
 
     def _sibling_names(self, obj):
         """Names of objects sharing the same model parent (for rename checks)."""
-        from PySide6.QtCore import QModelIndex
-
-        def walk(parent):
-            for row in range(self.model.rowCount(parent)):
-                idx = self.model.index(row, 0, parent)
-                node = idx.internalPointer()
-                if node is not None and node.obj is obj and node.parent is not None:
-                    return {getattr(sib.obj, "name", "") for sib in node.parent.children
-                            if sib.obj is not None and sib.obj is not obj}
-                found = walk(idx)
-                if found is not None:
-                    return found
-            return None
-        return walk(QModelIndex())
+        node = self.model.node_for(obj)
+        if node is None or node.parent is None:
+            return set()
+        return {getattr(sibling.obj, "name", "") for sibling in node.parent.children
+                if sibling.obj is not obj}
 
     def _tree_menu(self, pos):
         from PySide6.QtWidgets import QMenu
@@ -453,11 +447,21 @@ class MainWindow(QMainWindow):
             self._select(index)
         menu = QMenu(self)
         menu.addAction(t("rename"), self._rename_at)
-        if self._selected_node is not None and isinstance(self._selected_node.obj, SvdRegister):
-            self.bitview.set_register(self._selected_node.obj)
+        node = self._selected_node
+        if node is not None and isinstance(node.obj, REGISTER_TYPES):
             menu.addAction(t("field_batch"), self._batch_add_fields)
         menu.addSeparator()
-        menu.addAction(t("add"), self.add_selected_child)
+        if node is not None and isinstance(node.obj, CoreRegisterGroup):
+            menu.addAction(t("core_add_register"), self.add_selected_child)
+        elif node is not None and node.label == CORE_REGISTERS and node.obj is None:
+            menu.addAction(t("core_add_group"), self.add_selected_child)
+            menu.addAction(t("core_import"), self.import_core_profiles)
+        else:
+            menu.addAction(t("add"), self.add_selected_child)
+            if node is not None and isinstance(node.obj, (SvdDevice, CpuInfo)):
+                menu.addAction(t("core_add_group"), self.add_core_group)
+        if self._core_group_for(node) is not None:
+            menu.addAction(t("core_export"), self.export_core_profile)
         menu.addAction(t("duplicate"), self.duplicate_selected)
         menu.addAction(t("delete"), self.delete_selected)
         menu.addSeparator()
@@ -602,6 +606,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(t("copy_diagnostics"), self.copy_diagnostics)
         tools_menu.addSeparator()
         tools_menu.addAction(self.actions["import"])
+        tools_menu.addAction(t("core_import"), self.import_core_profiles)
+        tools_menu.addAction(t("core_export"), self.export_core_profile)
         tools_menu.addAction(self.actions["diff"])
         tools_menu.addAction(self.actions["overlay"])
         tools_menu.addAction(self.actions["batch"])
@@ -623,6 +629,8 @@ class MainWindow(QMainWindow):
         self._rebuild_menus()
         self._apply_texts()
         self._retranslate_panels()
+        if self.state.device is not None:
+            self._refresh()
 
     def _retranslate_panels(self):
         """Retranslate every panel so a language switch is truly global."""
@@ -646,8 +654,12 @@ class MainWindow(QMainWindow):
             self._update_status(self._selected_node)
 
     def show_ai_help(self):
-        from svdstudio.ui.ai_help import show_ai_help
-        show_ai_help(self)
+        QMessageBox.information(
+            self, t("ai_help"),
+            "CLI: svdstudio --help\n"
+            "SVD Studio.exe --cli --help\n\n"
+            "Python: svdstudio.application.project.open_svd / save_svd",
+        )
 
     def show_about(self):
         from svdstudio import __version__
@@ -658,7 +670,7 @@ class MainWindow(QMainWindow):
             "右侧属性支持 SVD 标准取值的下拉选择；寄存器地图支持批量添加与多选删除；\n"
             "位图双击空白位可新建字段；问题面板双击可跳转定位。\n\n"
             "工具：表格导入（含 Excel 适配）、设备对比 Diff、Overlay 厂商迁移、批量编辑。\n"
-            "自动化：帮助 → AI 与自动化接口，含 CLI / Python API / MCP 说明。\n"
+            "自动化：帮助 → AI 与自动化接口，含 CLI 和 Python API 说明。\n"
             f"SVD Studio v{__version__} — CMSIS-SVD workbench. "
             "See docs/ for architecture and roadmap.")
 
@@ -666,7 +678,6 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
         from PySide6.QtWidgets import QLineEdit as _LE
 
-        from svdstudio.domain.model import CpuInfo
         dialog = QDialog(self)
         dialog.setWindowTitle(t("new_device"))
         layout = QFormLayout(dialog)
@@ -681,16 +692,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        device = SvdDevice(name=name_edit.text().strip() or "NEWDEV",
+        name = name_edit.text().strip() or "NEWDEV"
+        device = SvdDevice(name=name, version="1.0",
                            vendor=vendor_edit.text().strip(),
-                           description=desc_edit.text().strip(),
-                           cpu=CpuInfo(name="CM4"))
-        self.state.device = device
-        self.state.path = ""
-        self.state.dirty = True
-        self.model.set_device(device)
-        self._clear_detail_panels()
-        self._selected_node = None
+                           description=desc_edit.text().strip() or name)
+        if not self._confirm_replace_device():
+            return
+        self._set_project(P.ProjectState(device=device, dirty=True))
         self.output.appendPlainText(f"已新建设备 / New device: {device.name}")
 
     def toggle_theme(self):
@@ -704,9 +712,37 @@ class MainWindow(QMainWindow):
         if view is not None and hasattr(view, "setModel"):
             from PySide6.QtGui import QStandardItemModel
             view.setModel(QStandardItemModel(0, 0))
+        for button in (self._map_add_btn, self._map_batch_btn, self._map_del_btn):
+            if button is not None:
+                button.setEnabled(False)
         if getattr(self, "_memory_map", None) is not None:
             self._memory_map.clear()
         self.problems.clear()
+
+    def _set_project(self, state):
+        self._open_request = None
+        self._selected_node = None
+        self.state = state
+        self.undo.clear()
+        self._expanded_ids = set()
+        self._map_signature_cache = None
+        self.model.set_device(state.device)
+        self._clear_detail_panels()
+        self.device_tree.expand(self.proxy.index(0, 0))
+
+    def _confirm_replace_device(self):
+        if not self.state.dirty:
+            return True
+        answer = QMessageBox.question(
+            self, t("unsaved_title"), t("unsaved_prompt"),
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            self.save()
+            return not self.state.dirty
+        return answer == QMessageBox.StandardButton.Discard
 
     def set_theme(self, mode: str):
         from PySide6.QtWidgets import QApplication
@@ -717,13 +753,43 @@ class MainWindow(QMainWindow):
         self.bitview.update()
         self.output.appendPlainText(f"主题 / Theme: {current_mode()}")
 
-    def open(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open SVD", "", "SVD (*.svd *.xml)")
-        if not path:
+    def open(self, path=None):
+        if not isinstance(path, (str, Path)):
+            path, _ = QFileDialog.getOpenFileName(self, "Open SVD", "", "SVD (*.svd *.xml)")
+        if not path or not self._confirm_replace_device():
             return
         from svdstudio.ui.load_worker import load_svd_async
-        self.statusBar().showMessage(f"Loading {Path(path).name}…")
-        load_svd_async(self, path, lambda s, i, e: self._on_open_done(path, s, i, e))
+
+        can_replace = self._pending_project_replacement()
+
+        def loaded(state, issues, error):
+            if can_replace(state is not None and error is None):
+                self._on_open_done(path, state, issues, error)
+
+        load_svd_async(self, str(path), loaded)
+
+    def _pending_project_replacement(self):
+        """Detect intervening edits and superseded loads before applying a result."""
+        request = object()
+        self._open_request = request
+        original = self.state
+
+        def edit_state():
+            index = self.undo.index()
+            command = self.undo.command(index - 1) if index else None
+            return self.state.device, self.state.dirty, command
+
+        device, was_dirty, command = edit_state()
+
+        def can_replace(success):
+            if self._open_request is not request or self.state is not original:
+                return False
+            current_device, is_dirty, current_command = edit_state()
+            changed = (current_device is not device or is_dirty != was_dirty
+                       or current_command is not command)
+            return not (success and changed and is_dirty) or self._confirm_replace_device()
+
+        return can_replace
 
     def _on_open_done(self, path, state, issues, error):
         if error is not None:
@@ -733,17 +799,12 @@ class MainWindow(QMainWindow):
         if state is None:  # user cancelled
             self.statusBar().showMessage("Open cancelled", 3000)
             return
-        self.state = state
-        self.model.set_device(self.state.device)
-        self._expanded_ids = set()
-        self._map_signature_cache = None
-        self._clear_detail_panels()
-        self._selected_node = None
+        self._set_project(state)
         self._last_issues = list(issues)
         self._show_issues(issues)
         self.workspace_state.setText(Path(path).stem.upper())
         self.output.appendPlainText(f"Loaded: {path}")
-        self._remember_recent(path)
+        self._remember_recent(str(path))
         self.statusBar().showMessage(
             f"Loaded {len(self.state.device.peripherals)} peripheral(s)", 5000)
 
@@ -819,13 +880,7 @@ class MainWindow(QMainWindow):
 
     def _add_single_field(self):
         """Header "+" button: open the field dialog at the first free bit."""
-        from svdstudio.domain.model import SvdRegister
-        node = self._selected_node
-        reg = None
-        if node is not None and isinstance(node.obj, SvdRegister):
-            reg = node.obj
-        elif self.bitview.reg is not None:
-            reg = self.bitview.reg
+        reg = self.bitview.reg
         if reg is None:
             self.statusBar().showMessage("请先选中一个寄存器", 3000)
             return
@@ -838,17 +893,16 @@ class MainWindow(QMainWindow):
         self._create_field_at_bit(bit)
 
     def _create_field_at_bit(self, bit: int):
-        from svdstudio.domain.model import SvdRegister
-        node = self._selected_node
-        reg = None
-        if node is not None and isinstance(node.obj, SvdRegister):
-            reg = node.obj
-        elif self.bitview.reg is not None:
-            reg = self.bitview.reg
+        reg = self.bitview.reg
         if reg is None:
             return
+        self._add_register_field(reg, bit)
+
+    def _add_register_field(self, reg, bit=0):
+        from svdstudio.domain.svd_defaults import new_field
         from svdstudio.ui.create_dialogs import FieldDialog
-        dialog = FieldDialog(reg.size_value, self)
+
+        dialog = FieldDialog(reg.size_value, self, core=isinstance(reg, CoreRegister))
         dialog.lsb.setText(str(bit))
         dialog.width.setText("1")
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -861,39 +915,52 @@ class MainWindow(QMainWindow):
         if any(f.name == name for f in reg.fields):
             QMessageBox.warning(self, "新建字段", f"字段 {name} 已存在")
             return
-        from svdstudio.domain.svd_defaults import new_field
+        for other in reg.fields:
+            if lsb + width <= other.bit_offset or other.bit_offset + other.bit_width <= lsb:
+                continue
+            if isinstance(reg, CoreRegister):
+                QMessageBox.warning(self, t("add"), t("field_err_overlap").format(name=other.name))
+                return
+            answer = QMessageBox.question(
+                self, t("add"), f"字段 {name} [{lsb + width - 1}:{lsb}] 与 {other.name} 重叠，仍要创建？"
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            break
         field_obj = new_field(name, lsb, width, parent_access=reg.access,
                               access=access, description=desc)
         self.undo.push(C.append_command(reg.fields, field_obj, f"新建字段 {name}", self._refresh))
         self.state.dirty = True
+        if isinstance(reg, CoreRegister):
+            self._select_object(field_obj)
 
     def _jump_to_problem(self):
         item = self.problems.currentItem()
         if item is None:
             return
-        text = item.text()
-        # path is embedded as "RULE path: message" — extract dotted path
-        import re
-        match = re.search(r"([A-Za-z_][\w]*\.[A-Za-z_][\w.]*?)(?::|\s)", text)
-        if not match:
-            return
-        self._select_by_path(match.group(1))
+        path = item.data(Qt.ItemDataRole.UserRole + 1)
+        if path:
+            self._select_by_path(path)
 
     def _select_by_path(self, path: str) -> bool:
         parts = path.split(".")
+
         def walk(parent, depth=0):
             for r in range(self.model.rowCount(parent)):
                 idx = self.model.index(r, 0, parent)
                 node = idx.internalPointer()
-                label = getattr(node.obj, "name", node.label) if node else ""
-                if label == parts[depth] or (depth == 0 and node.label == parts[depth]):
+                if node.obj is None and node.label == "Peripherals":
+                    found = walk(idx, depth)
+                    if found is not None:
+                        return found
+                label = "coreRegisters" if node.label == CORE_REGISTERS else node.label
+                if label == parts[depth] or getattr(node.obj, "name", "") == parts[depth]:
                     if depth == len(parts) - 1:
                         return idx
                     found = walk(idx, depth + 1)
                     if found is not None and found.isValid():
                         return found
             return None
-        from PySide6.QtCore import QModelIndex
         source = walk(QModelIndex())
         if source is not None and source.isValid():
             proxy_idx = self.proxy.mapFromSource(source)
@@ -906,19 +973,9 @@ class MainWindow(QMainWindow):
     def _show_issues(self, issues):
         from PySide6.QtWidgets import QListWidgetItem
 
-        from svdstudio.ui.palette import semantic_color
-
-        def _color(sev):
-            if sev == "ERROR":
-                return QColor(semantic_color("error"))
-            if sev == "WARNING":
-                return QColor(semantic_color("warning"))
-            if sev == "INFO":
-                return QColor(semantic_color("info"))
-            if sev == "HINT":
-                return QColor(semantic_color("info"))
-            return QColor(semantic_color("info"))
-
+        colors = {"ERROR": "#e89a9e", "WARNING": "#e5b476", "INFO": "#94c3ec"} if (
+            current_mode() == "dark"
+        ) else {"ERROR": "#a32732", "WARNING": "#864f03", "INFO": "#245f92"}
         self.problems.clear()
         self._issue_objects = list(issues)
         for issue in issues:
@@ -927,10 +984,9 @@ class MainWindow(QMainWindow):
             location = issue.location() if hasattr(issue, "location") else issue.path
             rule = f"{issue.rule_id}  " if issue.rule_id else ""
             item = QListWidgetItem(f"{marker} {rule}{location}\n     {issue.message}")
-            color = _color(sev)
-            if color is not None:
-                item.setForeground(color)
+            item.setForeground(QColor(colors.get(sev, colors["INFO"])))
             item.setData(Qt.ItemDataRole.UserRole, sev)
+            item.setData(Qt.ItemDataRole.UserRole + 1, issue.path)
             hint = getattr(issue, "suggestion", "")
             item.setToolTip(f"{issue.message}\n\n建议: {hint}" if hint
                             else "双击定位到对象")
@@ -1013,13 +1069,12 @@ class MainWindow(QMainWindow):
             return value
         return settings.value(key, value)
 
-    def _select(self, index):
+    def _select(self, index, _previous=None):
         source_index = self.proxy.mapToSource(index)
         node = source_index.internalPointer() if source_index.isValid() else None
         if node is None:
             return
-        if (self._selected_node is not None and self._selected_node.obj is node.obj
-                and self._selected_node.obj is not None):
+        if self._selected_node is node:
             # same object re-clicked (e.g. second half of a double-click):
             # do NOT rebuild the map/model or the in-place editor never opens
             self._sync_breadcrumb()
@@ -1031,30 +1086,20 @@ class MainWindow(QMainWindow):
             if not self.device_tree.isExpanded(parent):
                 self.device_tree.expand(parent)
             parent = parent.parent()
-        self._show_object(node.obj)
-        reg_obj = node.obj if isinstance(node.obj, SvdRegister) else None
-        address, periph = self._register_context(reg_obj) if reg_obj else (None, "")
-        self.bitview.set_register(reg_obj, address=address, peripheral=periph)
-        self._update_register_map(node.obj)
-        self._update_status(node)
+        self._show_selection(node)
         self._sync_breadcrumb()
 
-    def _update_status(self, obj):
-        from svdstudio.domain.model import SvdField, SvdRegister
-        node = self._selected_node
-        parts = []
-        cursor = node
-        while cursor is not None and cursor.obj is not None:
-            parts.append(getattr(cursor.obj, "name", ""))
-            cursor = cursor.parent
-        path = ".".join(reversed([p for p in parts if p]))
-        if isinstance(obj, SvdRegister) and self.state.device is not None:
-            self.statusBar().showMessage(f"{path}  size={obj.size_value}  reset={obj.reset_value_value:#x}")
-        elif isinstance(obj, SvdField):
-            label = str(obj.lsb) if obj.bit_width == 1 else f"{obj.msb}:{obj.lsb}"
-            self.statusBar().showMessage(f"{path}  bits {label}")
-        elif path:
-            self.statusBar().showMessage(path)
+    def _show_selection(self, node):
+        self._show_object(node.obj)
+        reg = node.obj
+        if isinstance(reg, SvdField) and node.parent is not None:
+            reg = node.parent.obj
+        if not isinstance(reg, REGISTER_TYPES):
+            reg = None
+        address, group = self._register_context(reg)
+        self.bitview.set_register(reg, address=address, peripheral=group)
+        self._update_register_map(node.obj)
+        self._update_status(node)
 
     @staticmethod
     def _map_signature(target) -> tuple:
@@ -1078,19 +1123,21 @@ class MainWindow(QMainWindow):
     def _update_register_map(self, obj):
         from PySide6.QtGui import QStandardItem, QStandardItemModel
 
-        from svdstudio.domain.model import SvdPeripheral, SvdRegister
         view = self.findChild(QWidget, "registerMapView")
         if view is None:
             return
-        target = None
-        if isinstance(obj, SvdPeripheral):
-            target = obj
-        elif isinstance(obj, SvdRegister) and self._selected_node.parent is not None:
-            parent_obj = self._selected_node.parent.obj
-            if isinstance(parent_obj, SvdPeripheral):
-                target = parent_obj
+        target = self._map_target()
         if target is None:
+            if self._map_signature_cache is not None:
+                view.setModel(QStandardItemModel(0, 0, view))
+                self._map_signature_cache = None
+            for button in (self._map_add_btn, self._map_batch_btn, self._map_del_btn):
+                if button is not None:
+                    button.setEnabled(False)
             return
+        for button in (self._map_add_btn, self._map_batch_btn, self._map_del_btn):
+            if button is not None:
+                button.setEnabled(True)
 
         signature = self._map_signature(target)
         if signature == getattr(self, "_map_signature_cache", None):
@@ -1255,29 +1302,21 @@ class MainWindow(QMainWindow):
                 if new != reg.reset_value_value:
                     self.undo.push(C.SetAttrCommand(reg, "reset_value", new, self._refresh))
                     self.state.dirty = True
-            elif col == 4:
-                if text != (reg.description or ""):
-                    self.undo.push(C.SetAttrCommand(reg, "description", text, self._refresh))
-                    self.state.dirty = True
+            elif col == 4 and text != (reg.description or ""):
+                self.undo.push(C.SetAttrCommand(reg, "description", text, self._refresh))
+                self.state.dirty = True
         except ValueError as error:
             # revert the cell; _refresh rebuilds the map from the domain anyway
             self._refresh()
             self.statusBar().showMessage(str(error), 4000)
 
     def _map_target(self):
-        from svdstudio.domain.model import SvdPeripheral
-        node = self._selected_node
-        if node is not None:
-            if isinstance(node.obj, SvdPeripheral):
-                self._map_peripheral = node.obj
-                return node.obj
-            cursor = node
-            while cursor is not None:
-                if isinstance(cursor.obj, SvdPeripheral):
-                    self._map_peripheral = cursor.obj
-                    return cursor.obj
-                cursor = cursor.parent
-        return getattr(self, "_map_peripheral", None)
+        cursor = self._selected_node
+        while cursor is not None:
+            if isinstance(cursor.obj, SvdPeripheral):
+                return cursor.obj
+            cursor = cursor.parent
+        return None
 
     def _select_register_from_map(self, peripheral, row: int):
         regs = sorted(peripheral.registers, key=lambda r: r.address_offset)
@@ -1396,11 +1435,95 @@ class MainWindow(QMainWindow):
         source = self.model.source_index_for(obj)
         if source is not None and source.isValid():
             proxy_idx = self.proxy.mapFromSource(source)
+            if not proxy_idx.isValid():
+                self.search.clear()
+                proxy_idx = self.proxy.mapFromSource(source)
             self.device_tree.setCurrentIndex(proxy_idx)
             # EnsureVisible, not PositionAtCenter: centering yanked the whole
             # tree (and, perceptually, the panels next to it) on every click.
             self.device_tree.scrollTo(proxy_idx, self.device_tree.ScrollHint.EnsureVisible)
             self._select(proxy_idx)
+
+    @staticmethod
+    def _core_group_for(node):
+        while node is not None:
+            if isinstance(node.obj, CoreRegisterGroup):
+                return node.obj
+            node = node.parent
+        return None
+
+    def import_core_profiles(self):
+        device = self.state.device
+        if device is None:
+            QMessageBox.information(self, t("core_import"), t("core_open_device"))
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, t("core_import"), "", "TMK ISS (*.xml *.jar);;XML (*.xml);;JAR (*.jar)"
+        )
+        if not path:
+            return
+        from svdstudio.infrastructure.tmk_registers import (
+            load_tmk_register_profile,
+            load_tmk_register_profiles_from_jar,
+        )
+
+        try:
+            if Path(path).suffix.lower() == ".jar":
+                new_groups = load_tmk_register_profiles_from_jar(path)
+            else:
+                new_groups = [load_tmk_register_profile(path)]
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, t("core_import"), str(error))
+            return
+
+        existing = {group.name: group for group in device.core_register_groups}
+        collisions = [group.name for group in new_groups if group.name in existing]
+        if collisions:
+            answer = QMessageBox.question(
+                self, t("core_import"), t("core_import_replace").format(names="\n".join(collisions))
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        existing.update((group.name, group) for group in new_groups)
+        self.undo.push(C.SetAttrCommand(
+            device, "core_register_groups", list(existing.values()), self._refresh
+        ))
+        self.state.dirty = True
+        if new_groups:
+            self._select_object(new_groups[0])
+        self.statusBar().showMessage(t("core_import_done").format(count=len(new_groups)), 5000)
+
+    def export_core_profile(self):
+        device = self.state.device
+        if device is None or not device.core_register_groups:
+            QMessageBox.information(self, t("core_export"), t("core_no_groups"))
+            return
+        group = self._core_group_for(self._selected_node)
+        if group is None:
+            names = [candidate.name for candidate in device.core_register_groups]
+            name, accepted = QInputDialog.getItem(
+                self, t("core_export"), t("core_profile_id"), names, editable=False
+            )
+            if not accepted:
+                return
+            group = device.core_register_groups[names.index(name)]
+        from svdstudio.infrastructure.tmk_registers import save_tmk_register_profile
+
+        built_in_names = {"TMS320C28XX": "c28xx.xml", "TMK_SIMULATOR_FPU": "c28xx-fpu.xml"}
+        filename = built_in_names.get(group.name)
+        if filename is None:
+            filename = group.name + ".xml" if group.name.isidentifier() else "profile.xml"
+        path, _ = QFileDialog.getSaveFileName(self, t("core_export"), filename, "XML (*.xml)")
+        if not path:
+            return
+        if not path.lower().endswith(".xml"):
+            path += ".xml"
+        try:
+            save_tmk_register_profile(group, path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, t("core_export"), str(error))
+            return
+        self.statusBar().showMessage(t("core_export_done").format(path=path), 5000)
 
     def run_import_wizard(self):
         from svdstudio.ui.import_wizard import ImportWizardDialog
@@ -1410,13 +1533,18 @@ class MainWindow(QMainWindow):
         # read widget state on the GUI thread, then run the heavy import
         # (CSV/XLSX parsing + domain build) in the background
         request = dialog.import_request()
-        if request is None:
+        if request is None or not self._confirm_replace_device():
             return
         from svdstudio.application.tabular_import import import_file
         from svdstudio.ui.load_worker import run_async
 
-        run_async(self, lambda: import_file(*request), self._on_import_done,
-                  "Importing table…", "Import table")
+        can_replace = self._pending_project_replacement()
+
+        def imported(result, error):
+            if can_replace(result is not None and result.valid and error is None):
+                self._on_import_done(result, error)
+
+        run_async(self, lambda: import_file(*request), imported, "Importing table…", "Import table")
 
     def _on_import_done(self, result, error):
         if error is not None:
@@ -1432,17 +1560,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import has errors",
                                 "Import produced errors. See Output panel.")
             return
-        from svdstudio.application import commands as CM
-        self.state.device = result.device
-        self.state.path = ""
-        self.state.dirty = True
-        self.model.set_device(result.device)
-        if result.device.peripherals:
-            self.undo.push(CM.InsertCommand(result.device.peripherals,
-                                            result.device.peripherals[0],
-                                            0, "Import table", self._refresh))
-            self.undo.pop()
-        self._refresh()
+        self._set_project(P.ProjectState(device=result.device, dirty=True))
         self.output.appendPlainText(
             f"Imported: {result.peripherals_created} peripheral(s), "
             f"{result.registers_created} register(s), {result.fields_created} field(s)")
@@ -1572,29 +1690,29 @@ class MainWindow(QMainWindow):
     def paste_selected(self):
         from copy import deepcopy
 
-        from svdstudio.application import commands as CM
-        from svdstudio.domain.model import SvdField, SvdPeripheral, SvdRegister
         if getattr(self, "_clipboard", None) is None or self._selected_node is None:
             return
         node = self._selected_node
         item = deepcopy(self._clipboard)
-        item.name = f"{item.name}_COPY"
-        if isinstance(item, SvdPeripheral) and hasattr(node.obj, "peripherals"):
-            self.undo.push(CM.append_command(node.obj.peripherals, item,
-                                             f"粘贴 {item.name}", self._refresh))
-        elif isinstance(item, SvdRegister) and isinstance(node.obj, SvdPeripheral):
-            self.undo.push(CM.append_command(node.obj.registers, item,
-                                             f"粘贴 {item.name}", self._refresh))
-        elif isinstance(item, SvdField) and isinstance(node.obj, SvdRegister):
-            self.undo.push(CM.append_command(node.obj.fields, item,
-                                             f"粘贴 {item.name}", self._refresh))
+        if isinstance(item, CoreRegisterGroup) and (
+            isinstance(node.obj, (SvdDevice, CpuInfo)) or
+            (node.obj is None and node.label == CORE_REGISTERS)
+        ):
+            items = self.state.device.core_register_groups
+        elif isinstance(item, SvdPeripheral) and isinstance(node.obj, SvdDevice):
+            items = node.obj.peripherals
+        elif ((isinstance(item, SvdRegister) and isinstance(node.obj, (SvdPeripheral, SvdCluster)))
+              or (isinstance(item, CoreRegister) and isinstance(node.obj, CoreRegisterGroup))):
+            items = node.obj.registers
+        elif isinstance(item, SvdField) and isinstance(node.obj, REGISTER_TYPES):
+            items = node.obj.fields
         else:
             QMessageBox.information(self, "粘贴", "类型与选中位置不匹配，无法粘贴。")
             return
+        item.name = self._unique_name(f"{item.name}_COPY", items)
+        self.undo.push(C.append_command(items, item, f"粘贴 {item.name}", self._refresh))
         self.state.dirty = True
-        self._refresh_register_map(node.obj)
-        # dotted-path search: jump when user typed Periph.Reg.Field
-        self._update_status(node)
+        self._select_object(item)
 
     def _update_status(self, node):
         from svdstudio.domain.model import SvdField
@@ -1612,7 +1730,11 @@ class MainWindow(QMainWindow):
 
     def _show_object(self, obj):
         """Single funnel for the property panel so every selection path stays in sync."""
-        self.props.set_object(obj)
+        node = self.model.node_for(obj)
+        core_field = isinstance(obj, SvdField) and node is not None and isinstance(
+            node.parent.obj, CoreRegister
+        )
+        self.props.set_object(obj, core_field=core_field)
         self._sync_memory_map(obj)
 
     def _build_map_header(self, layout):
@@ -1704,7 +1826,34 @@ class MainWindow(QMainWindow):
 
     def _edit(self, obj, attr, new):
         old = getattr(obj, attr, "")
-        self.undo.push(C.SetAttrCommand(obj, attr, new, self._refresh))
+        present = None
+        if isinstance(obj, CpuInfo):
+            present = (CPU_TAGS[attr], new is not None and new != "")
+            if new is None:
+                new = getattr(CpuInfo(), attr)
+        if attr == "name" and not isinstance(obj, CpuInfo) and (
+            not new or new in self._sibling_names(obj)
+        ):
+            self.statusBar().showMessage(t("rename_dup"), 4000)
+            self.props.refresh()
+            return
+        if isinstance(obj, CoreRegister) and attr == "size" and (
+            not 1 <= new <= MAX_CORE_REGISTER_BITS
+            or any(field.bit_offset + field.bit_width > new for field in obj.fields)
+        ):
+            self.statusBar().showMessage(t("field_err_range").format(size=old), 4000)
+            self.props.refresh()
+            return
+        if (isinstance(obj, SvdField) and isinstance(self.bitview.reg, CoreRegister)
+                and attr in ("bit_offset", "bit_width", "lsb", "msb")):
+            lsb = new if attr in ("bit_offset", "lsb") else obj.bit_offset
+            width = new if attr == "bit_width" else obj.bit_width
+            if attr == "msb":
+                width = new - lsb + 1
+            self._move_field_geometry(obj, lsb, width)
+            self.props.refresh()
+            return
+        self.undo.push(C.SetAttrCommand(obj, attr, new, self._refresh, present=present))
         self.state.dirty = True
         shown_old = f"{old:#x}" if isinstance(old, int) else old
         shown_new = f"{new:#x}" if isinstance(new, int) else new
@@ -1936,7 +2085,9 @@ class MainWindow(QMainWindow):
         self.open(path)
 
     def _register_context(self, obj) -> tuple[int | None, str]:
-        from svdstudio.domain.model import SvdRegister
+        if isinstance(obj, CoreRegister):
+            group = self._core_group_for(self.model.node_for(obj))
+            return None, group.name if group is not None else ""
         if not isinstance(obj, SvdRegister):
             return None, ""
         node = self.model.node_for(obj)
@@ -1949,7 +2100,12 @@ class MainWindow(QMainWindow):
             cursor = cursor.parent
         if periph is None:
             return None, ""
-        return periph.base_address + obj.address_offset, periph.name
+        offset = obj.address_offset
+        cursor = node.parent
+        while cursor is not None and isinstance(cursor.obj, SvdCluster):
+            offset += cursor.obj.address_offset
+            cursor = cursor.parent
+        return periph.base_address + offset, periph.name
 
     def _refresh(self):
         if not self.state.device or getattr(self, "_refreshing", False):
@@ -1967,31 +2123,35 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def _rebuild_views(self):
-        selected_obj = self._selected_node.obj if self._selected_node else None
+        old_node = self._selected_node
         # expansion is tracked incrementally by the expanded/collapsed signals,
         # so restoring costs O(expanded) instead of a walk over every node
         expanded_ids = set(getattr(self, "_expanded_ids", ()))
         self.model.set_device(self.state.device)
         self._expanded_ids = set()
-        if selected_obj is not None:
-            source = self.model.source_index_for(selected_obj)
-            if source.isValid():
-                self._selected_node = source.internalPointer()
+        self._selected_node = None
+        while old_node is not None and self._selected_node is None:
+            if old_node.obj is None:
+                self._selected_node = next(
+                    (node for node in self.model.root.children[0].children
+                     if node.obj is None and node.label == old_node.label), None
+                )
+            else:
+                self._selected_node = self.model.node_for(old_node.obj)
+            old_node = old_node.parent
         self._restore_expansion(expanded_ids)
         if self._selected_node is not None:
             proxy_idx = self.proxy.mapFromSource(
-                self.model.source_index_for(self._selected_node.obj))
+                self.model.source_index_for_node(self._selected_node))
             if proxy_idx.isValid():
                 self.device_tree.setCurrentIndex(proxy_idx)
-            self._show_object(self._selected_node.obj)
-            from svdstudio.domain.model import SvdRegister as _SR
-            reg_obj = self._selected_node.obj if isinstance(self._selected_node.obj, _SR) else None
-            address, periph = self._register_context(reg_obj) if reg_obj else (None, "")
-            self.bitview.set_register(reg_obj, address=address, peripheral=periph)
-            self._update_register_map(self._selected_node.obj)
-            self._update_status(self._selected_node)
+            self._show_selection(self._selected_node)
+        else:
+            self._show_object(None)
+            self.bitview.set_register(None)
+            self._update_register_map(None)
 
-    def _restore_expansion(self, expanded_ids: set[int]):
+    def _restore_expansion(self, expanded_ids: set[int | str]):
         """Re-expand only the paths that were open before the rebuild."""
         if not expanded_ids:
             return
@@ -2003,37 +2163,60 @@ class MainWindow(QMainWindow):
                 child = child_index.internalPointer()
                 if child is None:
                     continue
-                if id(child.obj) in expanded_ids:
+                key = id(child.obj) if child.obj is not None else child.label
+                if key in expanded_ids:
                     proxy_index = self.proxy.mapFromSource(child_index)
                     if proxy_index.isValid():
                         self.device_tree.expand(proxy_index)
-                        self._expanded_ids.add(id(child.obj))
+                        self._expanded_ids.add(key)
                         walk(child_index, child)
 
         walk(QModelIndex(), self.model.root)
 
     def _selected_collection(self):
-        node = self._selected_node
+        return self._collection_for_node(self._selected_node)
+
+    def _collection_for_node(self, node):
         if node is None or node.parent is None:
             return None
+        parent = node.parent.obj
         if isinstance(node.obj, SvdPeripheral):
             return self.state.device.peripherals
-        if isinstance(node.obj, SvdRegister) and isinstance(node.parent.obj, SvdPeripheral):
-            return node.parent.obj.registers
-        if isinstance(node.obj, SvdField) and isinstance(node.parent.obj, SvdRegister):
-            return node.parent.obj.fields
+        if isinstance(node.obj, CoreRegisterGroup):
+            return self.state.device.core_register_groups
+        if isinstance(node.obj, SvdCluster) and isinstance(parent, (SvdPeripheral, SvdCluster)):
+            return parent.clusters
+        if isinstance(node.obj, REGISTER_TYPES) and isinstance(
+            parent, (SvdPeripheral, SvdCluster, CoreRegisterGroup)
+        ):
+            return parent.registers
+        if isinstance(node.obj, SvdField) and isinstance(parent, REGISTER_TYPES):
+            return parent.fields
         return None
 
-    def _ask_name(self, title, default):
-        name, accepted = QInputDialog.getText(self, title, "Name:", text=default)
-        return name.strip() if accepted and name.strip() else None
+    def add_core_group(self):
+        if self.state.device is None:
+            QMessageBox.information(self, t("core_add_group"), t("core_open_device"))
+            return
+        name, accepted = QInputDialog.getText(self, t("core_add_group"), t("core_profile_id"))
+        name = name.strip()
+        if not accepted or not name:
+            return
+        groups = self.state.device.core_register_groups
+        if any(group.name == name for group in groups):
+            QMessageBox.warning(self, t("core_add_group"), t("rename_dup"))
+            return
+        group = CoreRegisterGroup(name=name)
+        self.undo.push(C.append_command(groups, group, t("core_add_group"), self._refresh))
+        self.state.dirty = True
+        self._select_object(group)
 
     def add_selected_child(self):
         """Context-aware creation: device->peripheral, peripheral->register/cluster,
         cluster->register, register->field, field->enum. All validated + undoable."""
-        from svdstudio.domain.model import SvdCluster, SvdPeripheral, SvdRegister
+        from svdstudio.domain.svd_defaults import new_register
         from svdstudio.ui.create_dialogs import (
-            FieldDialog,
+            CoreRegisterDialog,
             PeripheralDialog,
             RegisterDialog,
         )
@@ -2042,8 +2225,26 @@ class MainWindow(QMainWindow):
             return
         node = self._selected_node
         obj = node.obj if node is not None else self.state.device
+        if isinstance(obj, CpuInfo) or (obj is None and node.label == CORE_REGISTERS):
+            self.add_core_group()
+            return
+        if isinstance(obj, REGISTER_TYPES):
+            self._add_register_field(obj)
+            return
         try:
-            if isinstance(obj, SvdDevice) or obj is None:
+            if isinstance(obj, CoreRegisterGroup):
+                dialog = CoreRegisterDialog(self)
+                if dialog.exec() != dialog.DialogCode.Accepted:
+                    return
+                name, size, desc = dialog.parsed()
+                if any(reg.name == name for reg in obj.registers):
+                    QMessageBox.warning(self, t("core_add_register"), t("rename_dup"))
+                    return
+                item = CoreRegister(name=name, size=size, description=desc)
+                self.undo.push(C.append_command(
+                    obj.registers, item, t("core_add_register"), self._refresh
+                ))
+            elif isinstance(obj, SvdDevice) or obj is None:
                 dialog = PeripheralDialog(self)
                 if dialog.exec() != dialog.DialogCode.Accepted:
                     return
@@ -2051,7 +2252,7 @@ class MainWindow(QMainWindow):
                 item = SvdPeripheral(name=name, base_address=base, description=desc)
                 self.undo.push(C.append_command(self.state.device.peripherals, item,
                                                 f"新建外设 {name}", self._refresh))
-            elif isinstance(obj, SvdPeripheral):
+            elif isinstance(obj, (SvdPeripheral, SvdCluster)):
                 dialog = RegisterDialog(self)
                 if dialog.exec() != dialog.DialogCode.Accepted:
                     return
@@ -2059,42 +2260,10 @@ class MainWindow(QMainWindow):
                 if any(r.name == name for r in obj.registers):
                     QMessageBox.warning(self, t("add"), f"寄存器 {name} 已存在。")
                     return
-                from svdstudio.domain.svd_defaults import new_register
                 item = new_register(name, offset, size=size, access=access or "read-write",
                                     reset_value=reset, description=desc)
                 self.undo.push(C.append_command(obj.registers, item,
                                                 f"新建寄存器 {name}", self._refresh))
-            elif isinstance(obj, SvdCluster):
-                dialog = RegisterDialog(self)
-                if dialog.exec() != dialog.DialogCode.Accepted:
-                    return
-                name, offset, size, access, reset, desc = dialog.parsed()
-                item = new_register(name, offset, size=size, access=access or "read-write",
-                                    reset_value=reset, description=desc)
-                self.undo.push(C.append_command(obj.registers, item,
-                                                f"新建寄存器 {name}", self._refresh))
-            elif isinstance(obj, SvdRegister):
-                dialog = FieldDialog(obj.size_value, self)
-                if dialog.exec() != dialog.DialogCode.Accepted:
-                    return
-                name, lsb, width, access, desc = dialog.parsed()
-                if any(f.name == name for f in obj.fields):
-                    QMessageBox.warning(self, t("add"), f"字段 {name} 已存在。")
-                    return
-                for other in obj.fields:
-                    if not (lsb + width <= other.bit_offset
-                            or other.bit_offset + other.bit_width <= lsb):
-                        answer = QMessageBox.question(
-                            self, t("add"),
-                            f"字段 {name} [{lsb + width - 1}:{lsb}] 与 {other.name} 重叠，仍要创建？")
-                        if answer != QMessageBox.StandardButton.Yes:
-                            return
-                        break
-                from svdstudio.domain.svd_defaults import new_field
-                item = new_field(name, lsb, width, parent_access=obj.access,
-                               access=access, description=desc)
-                self.undo.push(C.append_command(obj.fields, item,
-                                                f"新建字段 {name}", self._refresh))
             else:
                 self.edit_enums()
                 return
@@ -2102,8 +2271,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, t("add"), str(error))
             return
         self.state.dirty = True
-        self._refresh()
-        self._reveal_selection()
+        self._select_object(item)
 
     def add_cluster_to_selected(self):
         from svdstudio.domain.model import SvdCluster, SvdPeripheral
@@ -2131,8 +2299,20 @@ class MainWindow(QMainWindow):
         if items is None:
             return
         item = C.clone_item(self._selected_node.obj)
+        item.name = self._unique_name(item.name, items)
         self.undo.push(C.InsertCommand(items, item, len(items), f"Duplicate {item.name}", self._refresh))
         self.state.dirty = True
+        self._select_object(item)
+
+    @staticmethod
+    def _unique_name(base, items):
+        names = {item.name for item in items}
+        name = base
+        suffix = 2
+        while name in names:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        return name
 
     def _tree_deletables(self):
         """All selected tree nodes that can be deleted, as (items, obj) pairs.
@@ -2140,7 +2320,6 @@ class MainWindow(QMainWindow):
         Ctrl+click / Shift+click multi-selection is supported; children of a
         selected parent are skipped so each object is deleted exactly once.
         """
-        from svdstudio.domain.model import SvdCluster, SvdField, SvdPeripheral, SvdRegister
         selected = self.device_tree.selectionModel().selectedRows()
         nodes = []
         for proxy_idx in selected:
@@ -2162,20 +2341,7 @@ class MainWindow(QMainWindow):
                 cursor = cursor.parent
             if ancestor_selected:
                 continue
-            items = None
-            if isinstance(node.obj, SvdPeripheral):
-                items = self.state.device.peripherals if self.state.device else None
-            elif isinstance(node.obj, SvdCluster) and node.parent is not None:
-                parent_obj = node.parent.obj
-                if isinstance(parent_obj, (SvdPeripheral, SvdCluster)):
-                    items = parent_obj.clusters
-            elif isinstance(node.obj, SvdRegister) and node.parent is not None:
-                parent_obj = node.parent.obj
-                if isinstance(parent_obj, (SvdPeripheral, SvdCluster)):
-                    items = parent_obj.registers
-            elif isinstance(node.obj, SvdField) and node.parent is not None \
-                    and isinstance(node.parent.obj, SvdRegister):
-                items = node.parent.obj.fields
+            items = self._collection_for_node(node)
             if items is not None and node.obj in items:
                 pairs.append((items, node.obj))
         return pairs
@@ -2197,7 +2363,6 @@ class MainWindow(QMainWindow):
             t("delete_confirm_multi").format(count=len(pairs), names=", ".join(names[:8])))
         if answer != QMessageBox.StandardButton.Yes:
             return
-        deleted = {id(obj) for _, obj in pairs}
         self.undo.beginMacro(t("delete"))
         try:
             by_list: dict[int, tuple[list, list]] = {}
@@ -2211,8 +2376,4 @@ class MainWindow(QMainWindow):
         finally:
             self.undo.endMacro()
         self.state.dirty = True
-        if self._selected_node is not None and id(self._selected_node.obj) in deleted:
-            self._selected_node = None
-            self._show_object(None)
-            self.bitview.set_register(None)
 
